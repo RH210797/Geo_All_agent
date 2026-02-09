@@ -1,14 +1,12 @@
 """
-Mint.ai Visibility MCP Server - Version 3.0.0
+Mint.ai Visibility MCP Server - Version 3.0.0 (Web/SSE Edition)
 
 Serveur MCP pour analyser la visibilité de marque dans les LLMs via l'API Mint.ai
+Compatible avec Render/Railway via SSE (Server-Sent Events).
 
 Tools disponibles:
 1. get_domains_and_topics - Liste tous les domaines et topics
 2. get_visibility_scores - Dataset complet (Date | EntityName | EntityType | Score | Model | Variation)
-
-Usage:
-  python mcp_mint_server.py
 """
 
 import asyncio
@@ -21,19 +19,24 @@ from typing import Any, Optional
 
 import httpx
 from mcp.server import Server
-from mcp.server.stdio import stdio_server
+# Note: On n'utilise plus stdio_server pour le web
 from mcp.types import Tool, TextContent
+
+# Nouveaux imports pour le mode Web (SSE)
+from starlette.applications import Starlette
+from starlette.routing import Route
+from mcp.server.sse import SseServerTransport
 
 # Configuration
 MINT_API_KEY = os.getenv("MINT_API_KEY", "")
 MINT_BASE_URL = os.getenv("MINT_BASE_URL", "https://api.getmint.ai/api")
 
-if not MINT_API_KEY:
-    raise RuntimeError("MINT_API_KEY environment variable is required")
-
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+if not MINT_API_KEY:
+    logger.warning("MINT_API_KEY environment variable is missing!")
 
 # Création du serveur MCP
 server = Server("mint-visibility-mcp")
@@ -43,6 +46,9 @@ server = Server("mint-visibility-mcp")
 
 async def fetch_api(path: str, params: dict = None) -> dict:
     """Effectue une requête GET vers l'API Mint.ai"""
+    if not MINT_API_KEY:
+        raise RuntimeError("MINT_API_KEY environment variable is required")
+        
     url = f"{MINT_BASE_URL}{path}"
     headers = {"X-API-Key": MINT_API_KEY}
     
@@ -57,14 +63,6 @@ async def fetch_api(path: str, params: dict = None) -> dict:
 async def get_domains_and_topics() -> dict:
     """
     Récupère tous les domaines et topics disponibles
-    
-    Returns:
-        {
-            "domains": [...],
-            "topics": [...],
-            "mapping": {"Domain > Topic": {"domainId": "...", "topicId": "..."}},
-            "summary": {"totalDomains": N, "totalTopics": M}
-        }
     """
     # Récupérer les domaines
     domains = await fetch_api("/domains")
@@ -126,41 +124,6 @@ async def get_visibility_scores(
 ) -> dict:
     """
     Récupère les scores de visibilité avec analyse par modèle
-    
-    Args:
-        domain_id: ID du domaine
-        topic_id: ID du topic
-        start_date: Date début (YYYY-MM-DD), défaut: 30 jours avant aujourd'hui
-        end_date: Date fin (YYYY-MM-DD), défaut: aujourd'hui
-        models: Filtre optionnel sur les modèles
-    
-    Returns:
-        {
-            "status": "success",
-            "data": {
-                "dataset": [
-                    {
-                        "Date": "2025-12-23",
-                        "EntityName": "Your Brand",
-                        "EntityType": "Brand",
-                        "Score": 64.14,
-                        "Model": "GLOBAL",
-                        "Variation_Points": null,
-                        "Variation_Percent": null
-                    },
-                    ...
-                ],
-                "metadata": {
-                    "totalRows": 150,
-                    "brandRows": 42,
-                    "competitorRows": 108,
-                    "uniqueCompetitors": 5,
-                    "modelsAnalyzed": 7,
-                    "models": ["GLOBAL", "gpt-5.1", "gemini-3-pro-preview", ...]
-                },
-                "columns": ["Date", "EntityName", "EntityType", "Score", "Model", "Variation_Points", "Variation_Percent"]
-            }
-        }
     """
     
     # Calcul des dates par défaut
@@ -218,8 +181,6 @@ async def get_visibility_scores(
 def build_dataset(global_data: dict, by_model_data: dict, available_models: list) -> dict:
     """
     Construit le dataset structuré
-    
-    Format: Date | EntityName | EntityType | Score | Model | Variation_Points | Variation_Percent
     """
     all_rows = []
     brand_name = "Your Brand"  # Peut être personnalisé
@@ -453,20 +414,29 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         )]
 
 
-# ========== MAIN ==========
+# ========== SERVER-SENT EVENTS (SSE) CONFIGURATION ==========
+# Cette partie remplace le bloc 'stdio_server' pour fonctionner sur le Web
 
-async def main():
-    """Lance le serveur MCP"""
-    logger.info("Starting Mint Visibility MCP Server v3.0.0")
-    logger.info(f"API Base URL: {MINT_BASE_URL}")
-    
-    async with stdio_server() as (read_stream, write_stream):
+sse = SseServerTransport("/messages")
+
+async def handle_sse(request):
+    """Gère la connexion SSE initiale"""
+    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
         await server.run(
-            read_stream,
-            write_stream,
+            streams[0],
+            streams[1],
             server.create_initialization_options()
         )
 
+async def handle_messages(request):
+    """Gère les messages entrants (POST)"""
+    await sse.handle_post_message(request.scope, request.receive, request._send)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# Création de l'application Starlette (c'est ce que Render va lancer)
+app = Starlette(
+    debug=True,
+    routes=[
+        Route("/sse", endpoint=handle_sse),
+        Route("/messages", endpoint=handle_messages, methods=["POST"])
+    ]
+)
