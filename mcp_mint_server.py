@@ -1,12 +1,8 @@
 """
-Mint.ai Visibility MCP Server - Version 3.0.0 (Web/SSE Edition)
+Mint.ai Visibility MCP Server - Version 3.1.0 (Web/SSE Edition + CORS)
 
 Serveur MCP pour analyser la visibilité de marque dans les LLMs via l'API Mint.ai
 Compatible avec Render/Railway via SSE (Server-Sent Events).
-
-Tools disponibles:
-1. get_domains_and_topics - Liste tous les domaines et topics
-2. get_visibility_scores - Dataset complet (Date | EntityName | EntityType | Score | Model | Variation)
 """
 
 import asyncio
@@ -19,13 +15,14 @@ from typing import Any, Optional
 
 import httpx
 from mcp.server import Server
-# Note: On n'utilise plus stdio_server pour le web
 from mcp.types import Tool, TextContent
-
-# Nouveaux imports pour le mode Web (SSE)
-from starlette.applications import Starlette
-from starlette.routing import Route
 from mcp.server.sse import SseServerTransport
+
+# Imports Starlette pour le serveur Web
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 
 # Configuration
 MINT_API_KEY = os.getenv("MINT_API_KEY", "")
@@ -414,29 +411,43 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         )]
 
 
-# ========== SERVER-SENT EVENTS (SSE) CONFIGURATION ==========
-# Cette partie remplace le bloc 'stdio_server' pour fonctionner sur le Web
+# ========== SERVER-SENT EVENTS (SSE) & CORS CONFIGURATION ==========
 
 sse = SseServerTransport("/messages")
 
-async def handle_sse(request):
-    """Gère la connexion SSE initiale"""
-    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+async def handle_sse(scope, receive, send):
+    """
+    Gère la connexion SSE initiale.
+    Utilise scope/receive/send directement pour éviter les erreurs ASGI/Response.
+    """
+    async with sse.connect_sse(scope, receive, send) as streams:
         await server.run(
             streams[0],
             streams[1],
             server.create_initialization_options()
         )
 
-async def handle_messages(request):
+async def handle_messages(scope, receive, send):
     """Gère les messages entrants (POST)"""
-    await sse.handle_post_message(request.scope, request.receive, request._send)
+    await sse.handle_post_message(scope, receive, send)
 
-# Création de l'application Starlette (c'est ce que Render va lancer)
+# Middleware CORS pour autoriser ChatGPT/Claude
+middleware = [
+    Middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+]
+
+# Création de l'application Web
 app = Starlette(
     debug=True,
     routes=[
         Route("/sse", endpoint=handle_sse),
         Route("/messages", endpoint=handle_messages, methods=["POST"])
-    ]
+    ],
+    middleware=middleware
 )
