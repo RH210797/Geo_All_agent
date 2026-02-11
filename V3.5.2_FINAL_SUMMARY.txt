@@ -1,0 +1,253 @@
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                                                                                ║
+║           MCP VISIBILITY TOOLS - VERSION 3.5.2 (FINAL ENHANCED)               ║
+║                                                                                ║
+║              Avec Guidage Complet pour les Paramètres Optionnels              ║
+║                                                                                ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+📦 FICHIERS LIVRÉS DANS CETTE VERSION:
+═══════════════════════════════════════════════════════════════════════════════
+
+1. ⭐ mcp_server_v3.5.2_FINAL.py
+   └─ Serveur MCP FINAL avec guidage COMPLET pour le LLM
+   └─ Explication détaillée des paramètres optionnels
+   └─ Tous les modèles listés avec descriptions
+   └─ Exemples concrets de quand ometre vs passer les paramètres
+
+2. 📋 OPTIONAL_PARAMETERS_GUIDE.md
+   └─ Guide dédié aux paramètres optionnels
+   └─ Tableau des scénarios
+   └─ Checklist de vérification
+   └─ Erreurs courantes + fixes
+   └─ Exemples concrets complets
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🎯 CHANGEMENTS CLÉS v3.5.2:
+═══════════════════════════════════════════════════════════════════════════════
+
+✅ PARAMÈTRES OPTIONNELS CLAIREMENT DOCUMENTÉS
+   ├─ startDate/endDate:
+   │  └─ Si OMIS → Retourne TOUTES les données ✅
+   │  └─ Explicitement indiqué dans les docstrings
+   │  └─ Exemples de quand les ometre
+   │
+   └─ models:
+      └─ Si OMIS → Retourne TOUS les modèles ✅
+      └─ Liste de tous les modèles disponibles
+      └─ Quand passer vs ometre clairement expliqué
+
+✅ TOUS LES MODÈLES LISTÉS AVEC DESCRIPTIONS:
+   ├─ GLOBAL                    (Score combiné)
+   ├─ gpt-5.1                   (OpenAI GPT-5.1)
+   ├─ sonar-pro                 (Perplexity Sonar Pro)
+   ├─ google-ai-overview        (Google AI Overview)
+   ├─ gpt-interface             (GPT Interface)
+   ├─ gemini-3-pro-preview      (Google Gemini 3 Pro)
+   └─ gpt-5                     (OpenAI GPT-5)
+
+✅ GUIDE COMPLET DANS LE CODE:
+   └─ 200+ lignes de commentaires surparamètres optionnels
+   └─ Scénarios listés (1-6)
+   └─ Règle d'or énoncée clairement
+   └─ Exemples d'appels réels pour chaque cas
+
+✅ GUIDE DÉDIÉ (OPTIONAL_PARAMETERS_GUIDE.md):
+   └─ Checklist: Est-ce que je dois passer le paramètre?
+   └─ Tableau récapitulatif (7 cas)
+   └─ Exemples concrets complets (5 cas)
+   └─ Erreurs courantes + fixes
+   └─ Quick reference
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🎓 RÈGLE D'OR - GRAVÉE DANS LE CODE:
+═══════════════════════════════════════════════════════════════════════════════
+
+   IF USER NE MENTIONNE PAS
+   → OMETS LE PARAMÈTRE
+   → SERVEUR RETOURNE DONNÉES COMPLÈTES ✅
+
+   IF USER DEMANDE
+   → PASSE LE PARAMÈTRE
+   → SERVEUR FILTRE SELON DEMANDE ✅
+
+═══════════════════════════════════════════════════════════════════════════════
+
+📊 CAS D'USAGE - OMETS vs PASSE:
+═══════════════════════════════════════════════════════════════════════════════
+
+Cas 1: "Analyse IBIS France"
+──────────────────────────
+startDate/endDate: ❌ OMETS (user ne demande pas)
+models: ❌ OMETS (user ne demande pas)
+Résultat: TOUTES les données, TOUS les modèles ✅
+
+Cas 2: "30 derniers jours"
+──────────────────────────
+startDate/endDate: ✅ PASSE (calcule 30j)
+models: ❌ OMETS (user ne demande pas)
+Résultat: 30 derniers jours, TOUS les modèles
+
+Cas 3: "GPT-5.1 uniquement"
+──────────────────────────
+startDate/endDate: ❌ OMETS (user ne demande pas)
+models: ✅ PASSE (models="gpt-5.1")
+Résultat: TOUTES les données, GPT-5.1 uniquement
+
+Cas 4: "Décembre 2025, compare GPT-5.1 vs Gemini"
+──────────────────────────────────────────────────
+startDate/endDate: ✅ PASSE (2025-12-01 à 2025-12-31)
+models: ✅ PASSE (models="gpt-5.1,gemini-3-pro-preview")
+Résultat: Décembre, 2 modèles + GLOBAL
+
+Cas 5: "Montre tout"
+────────────────────
+startDate/endDate: ❌ OMETS (user demande TOUT)
+models: ❌ OMETS (user demande TOUS les modèles)
+Résultat: TOUTES les données, TOUS les modèles ✅
+
+═══════════════════════════════════════════════════════════════════════════════
+
+📈 AMÉLIORATIONS v3.5.2 vs v3.5.1:
+═══════════════════════════════════════════════════════════════════════════════
+
+ASPECT              | v3.5.1              | v3.5.2
+────────────────────┼─────────────────────┼──────────────────────
+startDate/endDate   | Vaguement documenté | ✅ Très clair: omets si null
+models              | Mentionné           | ✅ Liste complète + quand passer
+Scénarios           | Quelques exemples   | ✅ 6 scénarios documentés
+Guide dédié         | Non                 | ✅ Guide complet (OPTIONAL...)
+Erreurs courantes   | Non documentées     | ✅ 3 erreurs + fixes expliquées
+Règle d'or          | Implicite           | ✅ EXPLICITE ET CLAIRE
+Exemples concrets   | Basiques            | ✅ Complets + détaillés
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🛠️ MODÈLES DISPONIBLES (7 TOTAL):
+═══════════════════════════════════════════════════════════════════════════════
+
+Pour filtrer sur un modèle spécifique, utilise:
+models="nom_du_modele"
+
+Ou plusieurs modèles:
+models="model1,model2,model3" (séparés par virgule, PAS d'espaces)
+
+Modèles disponibles:
+
+1. GLOBAL
+   → Score combiné (meilleur pour vue générale)
+   → Cas d'usage: Analyse générale, benchmark
+   → Passe: models="GLOBAL"
+
+2. gpt-5.1
+   → OpenAI GPT-5.1 (nouvelle)
+   → Cas d'usage: Résultats OpenAI récents
+   → Passe: models="gpt-5.1"
+
+3. sonar-pro
+   → Perplexity Sonar Pro
+   → Cas d'usage: Recherche avancée
+   → Passe: models="sonar-pro"
+
+4. google-ai-overview
+   → Google AI Overview
+   → Cas d'usage: Résultats Google
+   → Passe: models="google-ai-overview"
+
+5. gpt-interface
+   → GPT Interface (legacy)
+   → Cas d'usage: Comparaison historique
+   → Passe: models="gpt-interface"
+
+6. gemini-3-pro-preview
+   → Google Gemini 3 Pro Preview
+   → Cas d'usage: Résultats Gemini
+   → Passe: models="gemini-3-pro-preview"
+
+7. gpt-5
+   → OpenAI GPT-5 (flagship)
+   → Cas d'usage: Premium OpenAI results
+   → Passe: models="gpt-5"
+
+═══════════════════════════════════════════════════════════════════════════════
+
+✨ HIGHLIGHTS v3.5.2:
+═══════════════════════════════════════════════════════════════════════════════
+
+💡 Paramètres optionnels SUPER CLAIRS dans le code
+   └─ Le LLM COMPREND quand omettre vs passer
+
+💡 Tous les modèles listés AVEC cas d'usage
+   └─ Le LLM peut DIRECTEMENT filtrer si demandé
+
+💡 Guide dédié pour les paramètres optionnels
+   └─ Référence rapide pour chaque cas
+
+💡 Exemples concrets de quand ometre
+   └─ "Analyse IBIS France" → OMETS tout
+   └─ "GPT-5.1" → PASSE models
+   └─ "Décembre" → PASSE dates
+
+💡 Erreurs courantes documentées
+   └─ Avoid pitfalls grâce aux exemples
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🎯 UTILISATION:
+═══════════════════════════════════════════════════════════════════════════════
+
+1. Remplace ton serveur par: mcp_server_v3.5.2_FINAL.py
+
+2. Le LLM verra automatiquement dans la description de l'outil:
+   "⚠️ PARAMÈTRES OPTIONNELS:
+    startDate/endDate (si omis → toutes les données)
+    models (si omis → tous: GLOBAL, gpt-5.1, sonar-pro, ...)"
+
+3. Consulte OPTIONAL_PARAMETERS_GUIDE.md pour maîtriser
+
+═══════════════════════════════════════════════════════════════════════════════
+
+📞 CHECKLIST - AVANT D'APPELER L'OUTIL:
+═══════════════════════════════════════════════════════════════════════════════
+
+□ User mentionne des dates?
+  └─ OUI → Calcule startDate/endDate → Passe les paramètres
+  └─ NON → OMETS startDate et endDate → API retourne TOUT ✅
+
+□ User mentionne un modèle?
+  └─ OUI → models="nom_du_modele" ou "mod1,mod2"
+  └─ NON → OMETS models → API retourne TOUS ✅
+
+□ Si pas sûr?
+  └─ OMETS (pas de risque, API retourne données complètes)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+📊 RÉSUMÉ VERSION 3.5.2:
+═══════════════════════════════════════════════════════════════════════════════
+
+Version              | 3.5.2
+Status              | ✅ FINAL OPTIMISÉ
+Commentaires        | ✅ 500+ lignes
+Paramètres opt.     | ✅ SUPER CLAIRS
+Modèles listés      | ✅ 7 + descriptions
+Guide dédié         | ✅ Complet
+Exemples            | ✅ Concrets + détaillés
+Erreurs courantes   | ✅ Documentées
+Règle d'or          | ✅ EXPLICITE
+
+════════════════════════════════════════════════════════════════════════════════
+
+🎉 PRÊT À UTILISER!
+
+Commence par:
+1. Lire le code (mcp_server_v3.5.2_FINAL.py) - la doc est dans les commentaires
+2. Consulter OPTIONAL_PARAMETERS_GUIDE.md si tu as des questions
+3. Utiliser: User = "Analyse X" → OMETS dates/models ✅
+
+════════════════════════════════════════════════════════════════════════════════
+
+Bonne chance! 🚀
+
