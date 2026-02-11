@@ -209,7 +209,6 @@ import asyncio
 import json
 import logging
 import os
-import sys
 from datetime import date, timedelta
 from typing import Any
 from collections import defaultdict
@@ -219,59 +218,39 @@ from mcp.server import Server
 from mcp.types import Tool, TextContent
 from mcp.server.sse import SseServerTransport
 
-# Imports Starlette & Web
 from starlette.applications import Starlette
-from starlette.routing import Route
+from starlette.routing import Route, Mount
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
+from starlette.responses import Response
 
 # Configuration
 MINT_API_KEY = os.getenv("MINT_API_KEY", "")
 MINT_BASE_URL = os.getenv("MINT_BASE_URL", "https://api.getmint.ai/api")
 
-# Modèles disponibles (pour le LLM)
+# Modèles disponibles
 AVAILABLE_MODELS = [
-    "GLOBAL",                    # Score combiné (défaut)
-    "gpt-5.1",                  # OpenAI GPT-5.1
-    "sonar-pro",                # Perplexity Sonar Pro
-    "google-ai-overview",       # Google AI Overview
-    "gpt-interface",            # GPT Interface
-    "gemini-3-pro-preview",     # Google Gemini 3 Pro
-    "gpt-5"                     # OpenAI GPT-5
+    "GLOBAL", "gpt-5.1", "sonar-pro", "google-ai-overview",
+    "gpt-interface", "gemini-3-pro-preview", "gpt-5"
 ]
 
-# Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 if not MINT_API_KEY:
     logger.warning("MINT_API_KEY environment variable is missing!")
 
-# Création du serveur MCP
 server = Server("mint-visibility-mcp")
 
 
-# ========== UTILITAIRES POUR DATASET TABULAIRE ==========
+# ========== UTILITAIRES DATASET ==========
 
 def create_tabular_dataset(raw_dataset: list[dict]) -> dict:
-    """
-    🔧 FONCTION CLÉE: Transforme le dataset brut en PIVOT TABLE structuré
-    
-    Entrée:
-      - raw_dataset: liste de dicts avec Date, EntityName, Score, Model
-    
-    Sortie:
-      - Dataset pivotté avec:
-        * headers: ["Date", "Model", "Brand", "Competitor1", "Competitor2", ...]
-        * rows: Liste de dicts (une ligne = une date+model)
-        * entities: Liste des entités (Brand + Competitors)
-        * stats: Statistiques par entité (Moy, Min, Max, Count)
-    """
+    """🔧 Transforme dataset brut en PIVOT TABLE structuré"""
     if not raw_dataset:
         return {"error": "Aucune donnée"}
     
-    # Étape 1: Grouper par (date, model)
     pivot_data = {}
     all_entities = set()
     
@@ -289,7 +268,6 @@ def create_tabular_dataset(raw_dataset: list[dict]) -> dict:
         
         pivot_data[key][entity] = round(score, 2) if isinstance(score, (int, float)) else 0
     
-    # Étape 2: Trier les entités (Brand d'abord)
     all_entities = list(all_entities)
     if "Brand" in all_entities:
         all_entities.remove("Brand")
@@ -297,7 +275,6 @@ def create_tabular_dataset(raw_dataset: list[dict]) -> dict:
     
     headers = ["Date", "Model"] + all_entities
     
-    # Étape 3: Construire les lignes
     rows = []
     for key in sorted(pivot_data.keys()):
         row = {"Date": pivot_data[key]["Date"], "Model": pivot_data[key]["Model"]}
@@ -305,7 +282,6 @@ def create_tabular_dataset(raw_dataset: list[dict]) -> dict:
             row[entity] = pivot_data[key].get(entity, None)
         rows.append(row)
     
-    # Étape 4: Calculer stats
     stats = {}
     for entity in all_entities:
         scores = [r[entity] for r in rows if r[entity] is not None]
@@ -327,7 +303,7 @@ def create_tabular_dataset(raw_dataset: list[dict]) -> dict:
     }
 
 def format_as_markdown_table(tabular_data: dict) -> str:
-    """📊 Formate le dataset tabulaire en TABLE MARKDOWN lisible"""
+    """📊 Formate en TABLE MARKDOWN"""
     if "error" in tabular_data:
         return f"❌ {tabular_data['error']}"
     
@@ -335,7 +311,7 @@ def format_as_markdown_table(tabular_data: dict) -> str:
     rows = tabular_data.get("rows", [])
     
     if not rows:
-        return "❌ Aucune donnée à afficher"
+        return "❌ Aucune donnée"
     
     md = "| " + " | ".join(headers) + " |\n"
     md += "|" + "|".join([":---" for _ in headers]) + "|\n"
@@ -355,7 +331,7 @@ def format_as_markdown_table(tabular_data: dict) -> str:
     return md
 
 def format_as_csv(tabular_data: dict) -> str:
-    """📋 Formate le dataset en CSV exploitable"""
+    """📋 Formate en CSV"""
     if "error" in tabular_data:
         return f"Error: {tabular_data['error']}"
     
@@ -382,7 +358,7 @@ def format_as_csv(tabular_data: dict) -> str:
     return csv
 
 def format_stats_summary(tabular_data: dict) -> str:
-    """📊 Génère un RÉSUMÉ DES STATS lisible"""
+    """📊 RÉSUMÉ STATS"""
     if "error" in tabular_data:
         return f"❌ {tabular_data['error']}"
     
@@ -401,10 +377,10 @@ def format_stats_summary(tabular_data: dict) -> str:
     return summary
 
 
-# ========== LOGIQUE MÉTIER (API & TOOLS) ==========
+# ========== API CALLS ==========
 
 async def fetch_api(path: str, params: dict = None) -> dict:
-    """🔗 Appel API vers Mint.ai"""
+    """🔗 Appel API Mint.ai"""
     if not MINT_API_KEY:
         raise RuntimeError("MINT_API_KEY environment variable is required")
     async with httpx.AsyncClient() as client:
@@ -418,7 +394,7 @@ async def fetch_api(path: str, params: dict = None) -> dict:
         return response.json()
 
 async def get_domains_and_topics() -> dict:
-    """🌍 OUTIL #1: Liste les domaines et topics disponibles"""
+    """🌍 OUTIL #1: Liste domaines et topics"""
     domains = await fetch_api("/domains")
     all_topics = []
     mapping = {}
@@ -461,86 +437,22 @@ async def get_visibility_scores(
     output_format: str = "tabular"
 ) -> dict:
     """
-    📈 OUTIL #2: Récupère les scores de visibilité en dataset TABULAIRE
+    📈 OUTIL #2: Scores de visibilité en dataset TABULAIRE
     
-    ⚠️ PARAMÈTRES OPTIONNELS - TRÈS IMPORTANT POUR LE LLM:
-    ═════════════════════════════════════════════════════
+    ⚠️ PARAMÈTRES OPTIONNELS:
     
-    startDate (OPTIONNEL):
-      - Si OMIS → Retourne TOUTES les données disponibles ✅
-      - Si FOURNI → Format "YYYY-MM-DD" (ex: "2025-12-23")
-      - Cas courant: User dit "30 derniers jours" → calcule automatiquement
-      - Règle: SI user ne mentionne PAS de dates → OMETS ce paramètre
+    startDate/endDate: 
+      - SI OMIS → Retourne TOUTES les données ✅
+      - Format: "YYYY-MM-DD"
     
-    endDate (OPTIONNEL):
-      - Si OMIS → Retourne jusqu'à aujourd'hui/présent ✅
-      - Si FOURNI → Format "YYYY-MM-DD" (ex: "2026-02-10")
-      - Rarement utilisé seul (avec startDate généralement)
-      - Règle: SI user ne mentionne PAS de dates → OMETS ce paramètre
+    models:
+      - SI OMIS → Retourne TOUS les modèles ✅
+      - Disponibles: GLOBAL, gpt-5.1, sonar-pro, google-ai-overview,
+                     gpt-interface, gemini-3-pro-preview, gpt-5
+      - Format: "gpt-5.1" ou "gpt-5.1,sonar-pro" (pas d'espaces)
     
-    models (OPTIONNEL):
-      - Si OMIS → Retourne TOUS les modèles disponibles ✅
-      - Si FOURNI → Un modèle: "gpt-5.1" ou plusieurs: "gpt-5.1,sonar-pro"
-      
-      Modèles disponibles:
-      ├─ "GLOBAL"                    (défaut, score combiné)
-      ├─ "gpt-5.1"                   (OpenAI GPT-5.1)
-      ├─ "sonar-pro"                 (Perplexity Sonar Pro)
-      ├─ "google-ai-overview"        (Google AI Overview)
-      ├─ "gpt-interface"             (GPT Interface)
-      ├─ "gemini-3-pro-preview"      (Google Gemini 3 Pro)
-      └─ "gpt-5"                     (OpenAI GPT-5)
-      
-      - User demande "GPT-5.1"? → models="gpt-5.1"
-      - User demande "tous"? → OMETS le paramètre
-      - User demande "GPT et Sonar"? → models="gpt-5.1,sonar-pro"
-      - Règle: SI user ne mentionne PAS de modèle → OMETS ce paramètre
-    
-    output_format (OPTIONNEL):
-      - "tabular" (DÉFAUT): Table Markdown lisible + stats
-      - "csv": CSV pur pour Excel
-      - "json": JSON structuré
-      - "stats": Stats uniquement (5x rapide)
-    
-    EXEMPLES D'APPELS RÉELS:
-    ════════════════════════
-    
-    User: "Analyse IBIS France" (aucune date, aucun modèle)
-    → get_visibility_scores(domainId, topicId)
-       (OMETS startDate, endDate, models)
-    → Retour: TOUTES les données, TOUS les modèles
-    
-    User: "30 derniers jours" 
-    → Calcule dates: startDate = 30j avant, endDate = aujourd'hui
-    → get_visibility_scores(domainId, topicId, startDate="...", endDate="...")
-    → Retour: Données derniers 30j, TOUS les modèles
-    
-    User: "GPT-5.1 uniquement"
-    → get_visibility_scores(domainId, topicId, models="gpt-5.1")
-    → Retour: Tous les data, FILTRÉS sur GPT-5.1
-    
-    User: "Décembre 2025, compare GPT-5.1 vs Gemini"
-    → Calcule dates: startDate="2025-12-01", endDate="2025-12-31"
-    → get_visibility_scores(
-        domainId, topicId, 
-        startDate="2025-12-01", 
-        endDate="2025-12-31",
-        models="gpt-5.1,gemini-3-pro-preview"
-    )
-    → Retour: Données décembre, FILTRÉES sur 2 modèles
+    output_format: "tabular" (défaut) | "csv" | "json" | "stats"
     """
-    
-    # Étape 1: Valider les dates
-    # NOTE: Si startDate/endDate sont None, l'API retournera TOUT
-    if startDate and endDate:
-        # Utilise les dates fournies
-        pass
-    elif startDate or endDate:
-        # Un seul fourni? Accepté par l'API
-        pass
-    else:
-        # AUCUN fourni → API retournera TOUTES les données ✅
-        pass
     
     base_params = {
         "latestOnly": "false",
@@ -548,7 +460,6 @@ async def get_visibility_scores(
         "limit": "100"
     }
     
-    # Ajouter les dates si fournies
     if startDate:
         base_params["startDate"] = startDate
     if endDate:
@@ -561,13 +472,11 @@ async def get_visibility_scores(
     )
     available_models = global_data.get("availableModels", [])
     
-    # Filtre models si spécifié
+    # Filtre models
     models_to_fetch = []
     if models:
-        # User a demandé des modèles spécifiques
         models_to_fetch = [m.strip() for m in models.split(",")]
     else:
-        # User n'a rien demandé → TOUS les modèles ✅
         models_to_fetch = available_models
     
     # Récupération par modèle
@@ -582,11 +491,11 @@ async def get_visibility_scores(
         except: 
             pass
 
-    # Construction dataset brut
+    # Construction dataset
     raw_dataset = []
     
     def add_rows(data, model_name):
-        """Ajouter les scores au dataset brut"""
+        """Ajouter scores au dataset"""
         for entry in data.get("chartData", []):
             d = entry.get("date")
             raw_dataset.append({
@@ -610,7 +519,6 @@ async def get_visibility_scores(
         if m in by_model_data:
             add_rows(by_model_data[m], m)
 
-    # Transformer en dataset tabulaire
     tabular = create_tabular_dataset(raw_dataset)
     
     # Retourner selon le format
@@ -624,7 +532,6 @@ async def get_visibility_scores(
                 "total_rows": tabular.get("total_rows", 0),
                 "total_entities": tabular.get("total_entities", 0),
                 "models_returned": models_to_fetch if models else "ALL",
-                "instruction": "Copie ce CSV dans Excel/Google Sheets"
             }
         }
     
@@ -637,7 +544,6 @@ async def get_visibility_scores(
                 "all_available_models": available_models,
                 "models_returned": models_to_fetch if models else "ALL",
                 "date_range": f"{startDate or 'all'} to {endDate or 'all'}",
-                "instruction": "Utilise ce JSON pour traitement automatisé"
             }
         }
     
@@ -648,10 +554,9 @@ async def get_visibility_scores(
             "format": "stats",
             "output": stats_text,
             "metadata": tabular.get("stats"),
-            "instruction": "Ces stats permettent une analyse rapide"
         }
     
-    else:  # "tabular" (défaut)
+    else:  # "tabular"
         markdown_text = format_as_markdown_table(tabular)
         stats_text = format_stats_summary(tabular)
         full_output = f"{stats_text}\n\n## 📋 DATASET TABULAIRE\n\n{markdown_text}"
@@ -667,50 +572,34 @@ async def get_visibility_scores(
                 "date_range": f"{startDate or 'all'} to {endDate or 'all'}",
                 "all_available_models": available_models,
                 "models_returned": models_to_fetch if models else "ALL",
-                "instruction": "Analyse les stats + le tableau pour conclusions"
             }
         }
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    """📋 Liste les outils disponibles"""
+    """📋 Liste des outils"""
     return [
         Tool(
             name="get_domains_and_topics",
-            description="🌍 COMMENCER PAR LÀ: Liste domaines et topics avec IDs. Utilise cet outil en premier pour trouver les domainId/topicId corrects!",
+            description="🌍 COMMENCER PAR LÀ: Liste domaines et topics avec IDs.",
             inputSchema={"type": "object", "properties": {}}
         ),
         Tool(
             name="get_visibility_scores",
-            description="📈 ANALYSE: Dataset TABULAIRE (lignes=Date+Model, colonnes=Brand+Competitors). Formats: 'tabular' (défaut), 'csv' (Excel), 'json', 'stats' (rapide). ⚠️ PARAMÈTRES OPTIONNELS: startDate/endDate (si omis → toutes les données), models (si omis → tous: GLOBAL, gpt-5.1, sonar-pro, google-ai-overview, gpt-interface, gemini-3-pro-preview, gpt-5)",
+            description="📈 Dataset TABULAIRE. ⚠️ OPTIONNELS: startDate/endDate (si omis → tout), models (si omis → tous: GLOBAL, gpt-5.1, sonar-pro, google-ai-overview, gpt-interface, gemini-3-pro-preview, gpt-5)",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "domainId": {
-                        "type": "string",
-                        "description": "ID du domaine (REQUIS, obtenu de get_domains_and_topics)"
-                    },
-                    "topicId": {
-                        "type": "string",
-                        "description": "ID du topic (REQUIS, obtenu de get_domains_and_topics)"
-                    },
-                    "startDate": {
-                        "type": "string",
-                        "description": "⚠️ OPTIONNEL: Format YYYY-MM-DD (ex: 2025-12-23). SI OMIS → toutes les données! Ne l'utilise que si user mentionne une date de début."
-                    },
-                    "endDate": {
-                        "type": "string",
-                        "description": "⚠️ OPTIONNEL: Format YYYY-MM-DD (ex: 2026-02-10). SI OMIS → jusqu'à aujourd'hui/présent! Ne l'utilise que si user mentionne une date de fin."
-                    },
-                    "models": {
-                        "type": "string",
-                        "description": "⚠️ OPTIONNEL: Modèles à filtrer. SI OMIS → TOUS les modèles! Disponibles: GLOBAL, gpt-5.1, sonar-pro, google-ai-overview, gpt-interface, gemini-3-pro-preview, gpt-5. Format: 'gpt-5.1' ou 'gpt-5.1,sonar-pro' (séparés par virgule, sans espaces). Ne l'utilise que si user demande un modèle spécifique."
-                    },
+                    "domainId": {"type": "string", "description": "ID du domaine (REQUIS)"},
+                    "topicId": {"type": "string", "description": "ID du topic (REQUIS)"},
+                    "startDate": {"type": "string", "description": "⚠️ OPTIONNEL: YYYY-MM-DD. SI OMIS → toutes les données!"},
+                    "endDate": {"type": "string", "description": "⚠️ OPTIONNEL: YYYY-MM-DD. SI OMIS → jusqu'à présent!"},
+                    "models": {"type": "string", "description": "⚠️ OPTIONNEL: Filtrer modèles. SI OMIS → TOUS! Format: 'gpt-5.1' ou 'gpt-5.1,sonar-pro'"},
                     "output_format": {
                         "type": "string",
                         "enum": ["tabular", "csv", "json", "stats"],
-                        "description": "Format sortie: 'tabular' (DÉFAUT, table+stats) | 'csv' (pour Excel) | 'json' (pour code) | 'stats' (synthèse rapide, 5x plus rapide)"
+                        "description": "Format: 'tabular' (défaut) | 'csv' (Excel) | 'json' (code) | 'stats' (rapide)"
                     }
                 },
                 "required": ["domainId", "topicId"]
@@ -739,23 +628,36 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         return [TextContent(type="text", text=f"❌ Erreur: {str(e)}")]
 
 
-# ========== CONFIGURATION WEB (SSE) ==========
+# ========== ROUTES FIXES ==========
 
 sse = SseServerTransport("/messages")
 
-async def handle_sse_connect(request: Request):
-    """Gère la connexion SSE (GET)"""
-    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+async def handle_sse_messages(scope, receive, send):
+    """Gère les requêtes SSE /messages"""
+    async with sse.connect_sse(scope, receive, send) as streams:
         await server.run(streams[0], streams[1], server.create_initialization_options())
 
-async def handle_messages(request: Request):
-    """Gère les messages (POST)"""
-    await sse.handle_post_message(request.scope, request.receive, request._send)
+async def handle_post_messages(request: Request):
+    """Gère les POST /messages"""
+    return await sse.handle_post_message(request.scope, request.receive, request._send)
 
+# Routes corrigées (ne pas retourner None)
+async def messages_route(scope, receive, send):
+    """Route /messages - Wrapper pour SSE"""
+    if scope["method"] == "GET":
+        await handle_sse_messages(scope, receive, send)
+    elif scope["method"] == "POST":
+        # Créer une request Starlette
+        request = Request(scope, receive)
+        response = await handle_post_messages(request)
+        await response(scope, receive, send)
+    else:
+        response = Response("Method not allowed", status_code=405)
+        await response(scope, receive, send)
+
+# Routes correctes pour Starlette
 routes = [
-    Route("/sse", endpoint=handle_sse_connect, methods=["GET"]),
-    Route("/sse", endpoint=handle_messages, methods=["POST"]),
-    Route("/messages", endpoint=handle_messages, methods=["POST"])
+    Route("/messages", endpoint=messages_route, methods=["GET", "POST"]),
 ]
 
 middleware = [
