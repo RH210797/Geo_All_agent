@@ -209,6 +209,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from datetime import date, timedelta
 from typing import Any
 from collections import defaultdict
@@ -218,36 +219,37 @@ from mcp.server import Server
 from mcp.types import Tool, TextContent
 from mcp.server.sse import SseServerTransport
 
+# Imports Starlette & Web
 from starlette.applications import Starlette
-from starlette.routing import Route, Mount
+from starlette.routing import Route
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import StreamingResponse, JSONResponse
 
 # Configuration
 MINT_API_KEY = os.getenv("MINT_API_KEY", "")
 MINT_BASE_URL = os.getenv("MINT_BASE_URL", "https://api.getmint.ai/api")
 
-# Modèles disponibles
-AVAILABLE_MODELS = [
-    "GLOBAL", "gpt-5.1", "sonar-pro", "google-ai-overview",
-    "gpt-interface", "gemini-3-pro-preview", "gpt-5"
-]
-
-logging.basicConfig(level=logging.INFO)
+# Logging vers stderr
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stderr
+)
 logger = logging.getLogger(__name__)
 
 if not MINT_API_KEY:
-    logger.warning("MINT_API_KEY environment variable is missing!")
+    logger.warning("⚠️ MINT_API_KEY environment variable is missing!")
 
+# Création du serveur MCP
 server = Server("mint-visibility-mcp")
 
 
-# ========== UTILITAIRES DATASET ==========
+# ========== UTILITAIRES POUR DATASET TABULAIRE ==========
 
 def create_tabular_dataset(raw_dataset: list[dict]) -> dict:
-    """🔧 Transforme dataset brut en PIVOT TABLE structuré"""
+    """Transforme dataset brut en PIVOT TABLE structuré"""
     if not raw_dataset:
         return {"error": "Aucune donnée"}
     
@@ -274,8 +276,8 @@ def create_tabular_dataset(raw_dataset: list[dict]) -> dict:
         all_entities = ["Brand"] + sorted(all_entities)
     
     headers = ["Date", "Model"] + all_entities
-    
     rows = []
+    
     for key in sorted(pivot_data.keys()):
         row = {"Date": pivot_data[key]["Date"], "Model": pivot_data[key]["Model"]}
         for entity in all_entities:
@@ -302,8 +304,9 @@ def create_tabular_dataset(raw_dataset: list[dict]) -> dict:
         "total_entities": len(all_entities)
     }
 
+
 def format_as_markdown_table(tabular_data: dict) -> str:
-    """📊 Formate en TABLE MARKDOWN"""
+    """Formate en TABLE MARKDOWN"""
     if "error" in tabular_data:
         return f"❌ {tabular_data['error']}"
     
@@ -330,35 +333,9 @@ def format_as_markdown_table(tabular_data: dict) -> str:
     
     return md
 
-def format_as_csv(tabular_data: dict) -> str:
-    """📋 Formate en CSV"""
-    if "error" in tabular_data:
-        return f"Error: {tabular_data['error']}"
-    
-    headers = tabular_data.get("headers", [])
-    rows = tabular_data.get("rows", [])
-    
-    if not rows:
-        return "No data"
-    
-    csv = ",".join(headers) + "\n"
-    
-    for row in rows:
-        values = []
-        for h in headers:
-            val = row.get(h)
-            if val is None:
-                values.append("")
-            elif isinstance(val, float):
-                values.append(f"{val:.2f}")
-            else:
-                values.append(str(val))
-        csv += ",".join(values) + "\n"
-    
-    return csv
 
 def format_stats_summary(tabular_data: dict) -> str:
-    """📊 RÉSUMÉ STATS"""
+    """Résumé des stats"""
     if "error" in tabular_data:
         return f"❌ {tabular_data['error']}"
     
@@ -380,24 +357,25 @@ def format_stats_summary(tabular_data: dict) -> str:
 # ========== API CALLS ==========
 
 async def fetch_api(path: str, params: dict = None) -> dict:
-    """🔗 Appel API Mint.ai"""
+    """Appel API Mint.ai"""
     if not MINT_API_KEY:
         raise RuntimeError("MINT_API_KEY environment variable is required")
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.get(
-            f"{MINT_BASE_URL}{path}", 
-            params=params or {}, 
-            headers={"X-API-Key": MINT_API_KEY}, 
-            timeout=30.0
+            f"{MINT_BASE_URL}{path}",
+            params=params or {},
+            headers={"X-API-Key": MINT_API_KEY}
         )
         response.raise_for_status()
         return response.json()
 
+
 async def get_domains_and_topics() -> dict:
-    """🌍 OUTIL #1: Liste domaines et topics"""
+    """OUTIL #1: Liste domaines et topics"""
     domains = await fetch_api("/domains")
     all_topics = []
     mapping = {}
+    
     for domain in domains:
         d_id = domain.get("id")
         d_name = domain.get("displayName", domain.get("name", "Unknown"))
@@ -407,72 +385,65 @@ async def get_domains_and_topics() -> dict:
                 t_id = topic.get("id")
                 t_name = topic.get("displayName", topic.get("name", "Unknown"))
                 all_topics.append({
-                    "id": t_id, 
-                    "name": t_name, 
-                    "domainId": d_id, 
+                    "id": t_id,
+                    "name": t_name,
+                    "domainId": d_id,
                     "domainName": d_name
                 })
                 mapping[f"{d_name} > {t_name}"] = {
-                    "domainId": d_id, 
+                    "domainId": d_id,
                     "topicId": t_id
                 }
-        except Exception: 
+        except Exception:
             continue
     
     return {
-        "status": "success", 
+        "status": "success",
         "data": {
-            "domains": domains, 
-            "topics": all_topics, 
+            "domains": domains,
+            "topics": all_topics,
             "mapping": mapping
         }
     }
 
+
 async def get_visibility_scores(
-    domainId: str, 
-    topicId: str, 
-    startDate: str = None, 
-    endDate: str = None, 
+    domainId: str,
+    topicId: str,
+    startDate: str = None,
+    endDate: str = None,
     models: str = None,
     output_format: str = "tabular"
 ) -> dict:
     """
-    📈 OUTIL #2: Scores de visibilité en dataset TABULAIRE
-    
+    OUTIL #2: Scores de visibilité en dataset TABULAIRE
+
     ⚠️ PARAMÈTRES OPTIONNELS:
-    
-    startDate/endDate: 
-      - SI OMIS → Retourne TOUTES les données ✅
-      - Format: "YYYY-MM-DD"
-    
-    models:
-      - SI OMIS → Retourne TOUS les modèles ✅
-      - Disponibles: GLOBAL, gpt-5.1, sonar-pro, google-ai-overview,
-                     gpt-interface, gemini-3-pro-preview, gpt-5
-      - Format: "gpt-5.1" ou "gpt-5.1,sonar-pro" (pas d'espaces)
-    
-    output_format: "tabular" (défaut) | "csv" | "json" | "stats"
+    - startDate/endDate: SI OMIS → toutes les données
+    - models: SI OMIS → tous les modèles
+    - output_format: "tabular" (défaut) | "csv" | "json" | "stats"
     """
     
+    if not startDate or not endDate:
+        endDate = date.today().strftime("%Y-%m-%d")
+        startDate = (date.today() - timedelta(days=30)).strftime("%Y-%m-%d")
+    
     base_params = {
+        "startDate": startDate,
+        "endDate": endDate,
         "latestOnly": "false",
-        "page": "1", 
+        "page": "1",
         "limit": "100"
     }
     
-    if startDate:
-        base_params["startDate"] = startDate
-    if endDate:
-        base_params["endDate"] = endDate
-    
     # Récupération Global
     global_data = await fetch_api(
-        f"/domains/{domainId}/topics/{topicId}/visibility/aggregated", 
+        f"/domains/{domainId}/topics/{topicId}/visibility/aggregated",
         base_params
     )
     available_models = global_data.get("availableModels", [])
     
-    # Filtre models
+    # Filtre models si spécifié
     models_to_fetch = []
     if models:
         models_to_fetch = [m.strip() for m in models.split(",")]
@@ -485,45 +456,48 @@ async def get_visibility_scores(
         try:
             params = {**base_params, "models": m}
             by_model_data[m] = await fetch_api(
-                f"/domains/{domainId}/topics/{topicId}/visibility/aggregated", 
+                f"/domains/{domainId}/topics/{topicId}/visibility/aggregated",
                 params
             )
-        except: 
+        except Exception:
             pass
 
     # Construction dataset
-    raw_dataset = []
+    dataset = []
     
     def add_rows(data, model_name):
-        """Ajouter scores au dataset"""
         for entry in data.get("chartData", []):
             d = entry.get("date")
-            raw_dataset.append({
-                "Date": d, 
-                "EntityName": "Brand", 
-                "EntityType": "Brand", 
-                "Score": entry.get("brand"), 
+            dataset.append({
+                "Date": d,
+                "EntityName": "Brand",
+                "EntityType": "Brand",
+                "Score": entry.get("brand"),
                 "Model": model_name
             })
             for c_name, c_score in entry.get("competitors", {}).items():
-                raw_dataset.append({
-                    "Date": d, 
-                    "EntityName": c_name, 
-                    "EntityType": "Competitor", 
-                    "Score": c_score, 
+                dataset.append({
+                    "Date": d,
+                    "EntityName": c_name,
+                    "EntityType": "Competitor",
+                    "Score": c_score,
                     "Model": model_name
                 })
 
     add_rows(global_data, "GLOBAL")
-    for m in models_to_fetch: 
+    for m in models_to_fetch:
         if m in by_model_data:
             add_rows(by_model_data[m], m)
 
-    tabular = create_tabular_dataset(raw_dataset)
+    # Transformer en dataset tabulaire
+    tabular = create_tabular_dataset(dataset)
     
     # Retourner selon le format
     if output_format == "csv":
-        csv_text = format_as_csv(tabular)
+        csv_text = ",".join(tabular.get("headers", [])) + "\n"
+        for row in tabular.get("rows", []):
+            values = [str(row.get(h, "")) for h in tabular.get("headers", [])]
+            csv_text += ",".join(values) + "\n"
         return {
             "status": "success",
             "format": "csv",
@@ -531,7 +505,6 @@ async def get_visibility_scores(
             "metadata": {
                 "total_rows": tabular.get("total_rows", 0),
                 "total_entities": tabular.get("total_entities", 0),
-                "models_returned": models_to_fetch if models else "ALL",
             }
         }
     
@@ -541,9 +514,7 @@ async def get_visibility_scores(
             "format": "json",
             "output": tabular,
             "metadata": {
-                "all_available_models": available_models,
-                "models_returned": models_to_fetch if models else "ALL",
-                "date_range": f"{startDate or 'all'} to {endDate or 'all'}",
+                "date_range": f"{startDate} to {endDate}",
             }
         }
     
@@ -553,7 +524,6 @@ async def get_visibility_scores(
             "status": "success",
             "format": "stats",
             "output": stats_text,
-            "metadata": tabular.get("stats"),
         }
     
     else:  # "tabular"
@@ -568,38 +538,35 @@ async def get_visibility_scores(
             "metadata": {
                 "total_rows": tabular.get("total_rows", 0),
                 "total_entities": tabular.get("total_entities", 0),
-                "entities": tabular.get("entities", []),
-                "date_range": f"{startDate or 'all'} to {endDate or 'all'}",
-                "all_available_models": available_models,
-                "models_returned": models_to_fetch if models else "ALL",
             }
         }
 
 
+# ========== TOOLS REGISTRATION ==========
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    """📋 Liste des outils"""
     return [
         Tool(
             name="get_domains_and_topics",
-            description="🌍 COMMENCER PAR LÀ: Liste domaines et topics avec IDs.",
+            description="🌍 Liste tous les domaines et topics disponibles. Utilise cet outil en premier.",
             inputSchema={"type": "object", "properties": {}}
         ),
         Tool(
             name="get_visibility_scores",
-            description="📈 Dataset TABULAIRE. ⚠️ OPTIONNELS: startDate/endDate (si omis → tout), models (si omis → tous: GLOBAL, gpt-5.1, sonar-pro, google-ai-overview, gpt-interface, gemini-3-pro-preview, gpt-5)",
+            description="📈 Récupère les scores de visibilité en dataset tabulaire. Paramètres optionnels: startDate/endDate (YYYY-MM-DD), models (GLOBAL,gpt-5.1,sonar-pro,google-ai-overview,gpt-interface,gemini-3-pro-preview,gpt-5). Si omis → retour complet.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "domainId": {"type": "string", "description": "ID du domaine (REQUIS)"},
                     "topicId": {"type": "string", "description": "ID du topic (REQUIS)"},
-                    "startDate": {"type": "string", "description": "⚠️ OPTIONNEL: YYYY-MM-DD. SI OMIS → toutes les données!"},
-                    "endDate": {"type": "string", "description": "⚠️ OPTIONNEL: YYYY-MM-DD. SI OMIS → jusqu'à présent!"},
-                    "models": {"type": "string", "description": "⚠️ OPTIONNEL: Filtrer modèles. SI OMIS → TOUS! Format: 'gpt-5.1' ou 'gpt-5.1,sonar-pro'"},
+                    "startDate": {"type": "string", "description": "Date début YYYY-MM-DD (optionnel)"},
+                    "endDate": {"type": "string", "description": "Date fin YYYY-MM-DD (optionnel)"},
+                    "models": {"type": "string", "description": "Modèles à filtrer (optionnel, séparés par virgule)"},
                     "output_format": {
                         "type": "string",
                         "enum": ["tabular", "csv", "json", "stats"],
-                        "description": "Format: 'tabular' (défaut) | 'csv' (Excel) | 'json' (code) | 'stats' (rapide)"
+                        "description": "Format de sortie"
                     }
                 },
                 "required": ["domainId", "topicId"]
@@ -607,9 +574,12 @@ async def list_tools() -> list[Tool]:
         )
     ]
 
+
 @server.call_tool()
 async def call_tool(name: str, arguments: Any) -> list[TextContent]:
-    """🔧 Exécute un outil"""
+    """Exécute un outil"""
+    logger.info(f"Calling tool: {name}")
+    
     try:
         if name == "get_domains_and_topics":
             res = await get_domains_and_topics()
@@ -625,39 +595,33 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(res, indent=2, default=str))]
     
     except Exception as e:
+        logger.error(f"Tool error: {str(e)}", exc_info=True)
         return [TextContent(type="text", text=f"❌ Erreur: {str(e)}")]
 
 
-# ========== ROUTES FIXES ==========
+# ========== CONFIGURATION WEB (SSE + STARLETTE) ==========
 
 sse = SseServerTransport("/messages")
 
-async def handle_sse_messages(scope, receive, send):
-    """Gère les requêtes SSE /messages"""
-    async with sse.connect_sse(scope, receive, send) as streams:
+
+async def handle_sse_connect(request: Request):
+    """Gère la connexion SSE (GET)"""
+    logger.info("SSE client connected via GET")
+    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
         await server.run(streams[0], streams[1], server.create_initialization_options())
 
-async def handle_post_messages(request: Request):
-    """Gère les POST /messages"""
-    return await sse.handle_post_message(request.scope, request.receive, request._send)
 
-# Routes corrigées (ne pas retourner None)
-async def messages_route(scope, receive, send):
-    """Route /messages - Wrapper pour SSE"""
-    if scope["method"] == "GET":
-        await handle_sse_messages(scope, receive, send)
-    elif scope["method"] == "POST":
-        # Créer une request Starlette
-        request = Request(scope, receive)
-        response = await handle_post_messages(request)
-        await response(scope, receive, send)
-    else:
-        response = Response("Method not allowed", status_code=405)
-        await response(scope, receive, send)
+async def handle_sse_post(request: Request):
+    """Gère les messages SSE (POST)"""
+    logger.info("SSE client posting message")
+    await sse.handle_post_message(request.scope, request.receive, request._send)
 
-# Routes correctes pour Starlette
+
+# Routes explicites pour SSE et messages standards
 routes = [
-    Route("/messages", endpoint=messages_route, methods=["GET", "POST"]),
+    Route("/sse", endpoint=handle_sse_connect, methods=["GET"]),
+    Route("/sse", endpoint=handle_sse_post, methods=["POST"]),
+    Route("/messages", endpoint=handle_sse_post, methods=["POST"])
 ]
 
 middleware = [
@@ -670,3 +634,7 @@ middleware = [
 ]
 
 app = Starlette(debug=True, routes=routes, middleware=middleware)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
