@@ -2,53 +2,57 @@
 
 Serveur MCP pour analyser la visibilité de marque dans les LLMs via l'API Mint.ai
 
-**Version 3.0.0** - Dataset structuré complet
+**Version 3.5.0** - Top Domains & URLs par modèle LLM
 
-## 🛠️ Tools disponibles (2)
+---
+
+## 🛠️ Tools disponibles (3)
+
+---
 
 ### 1. `get_domains_and_topics`
 
-Liste TOUS les domaines et topics disponibles.
+Liste tous les domaines et topics disponibles. **À utiliser en premier** pour récupérer les IDs nécessaires aux autres tools.
 
-**Utilisation** :
+**Exemples d'utilisation :**
 - "Quels domaines j'ai ?"
 - "Liste mes topics"
 
-**Retour** :
+**Retour :**
 ```json
 {
   "domains": [...],
   "topics": [...],
   "mapping": {
-    "Fairmont > Fairmont US": {
-      "domainId": "694a86...",
-      "topicId": "694a86..."
+    "IBIS > IBIS FR": {
+      "domainId": "694a...",
+      "topicId": "694a..."
     }
-  },
-  "summary": {
-    "totalDomains": 5,
-    "totalTopics": 15
   }
 }
 ```
 
+---
+
 ### 2. `get_visibility_scores`
 
-Analyse COMPLÈTE avec dataset structuré (Brand + Competitors par modèle).
+Scores de visibilité Brand + Competitors, par modèle LLM, sur une période donnée.
 
-**Format du dataset** :
+**Paramètres :**
+| Paramètre | Requis | Description |
+|-----------|--------|-------------|
+| `domainId` | ✅ | ID du domaine |
+| `topicId` | ✅ | ID du topic |
+| `startDate` | optionnel | Date début YYYY-MM-DD (défaut : -365 jours) |
+| `endDate` | optionnel | Date fin YYYY-MM-DD (défaut : aujourd'hui) |
+| `models` | optionnel | Filtre modèles séparés par virgule |
+
+**Format du dataset retourné :**
 ```
-Date | EntityName | EntityType | Score | Model | Variation_Points | Variation_Percent
+Date | EntityName | EntityType | Score | Model
 ```
 
-**Paramètres** :
-- `domainId` (requis) - ID du domaine
-- `topicId` (requis) - ID du topic
-- `startDate` (optionnel) - Date début YYYY-MM-DD
-- `endDate` (optionnel) - Date fin YYYY-MM-DD
-- `models` (optionnel) - Filtre modèles
-
-**Retour** :
+**Retour :**
 ```json
 {
   "status": "success",
@@ -59,31 +63,82 @@ Date | EntityName | EntityType | Score | Model | Variation_Points | Variation_Pe
         "EntityName": "Your Brand",
         "EntityType": "Brand",
         "Score": 64.14,
-        "Model": "GLOBAL",
-        "Variation_Points": null,
-        "Variation_Percent": null
+        "Model": "GLOBAL"
       },
       {
         "Date": "2025-12-23",
-        "EntityName": "Four Seasons",
+        "EntityName": "Competitor A",
         "EntityType": "Competitor",
         "Score": 44.82,
-        "Model": "GLOBAL",
-        "Variation_Points": null,
-        "Variation_Percent": null
+        "Model": "gpt-5"
       }
     ],
     "metadata": {
-      "totalRows": 150,
-      "brandRows": 42,
-      "competitorRows": 108,
-      "uniqueCompetitors": 5,
-      "modelsAnalyzed": 7,
-      "models": ["GLOBAL", "gpt-5.1", "gemini-3-pro-preview", ...]
+      "models": ["GLOBAL", "gpt-5", "gemini-3-pro-preview", "sonar-pro", "gpt-interface"]
     }
   }
 }
 ```
+
+---
+
+### 3. `get_citations`
+
+Top domaines et top URLs cités par les LLMs dans leurs réponses, par modèle.
+
+Effectue **1 call GLOBAL + 1 call par modèle disponible en parallèle** (`asyncio.gather`), ce qui permet de comparer quels domaines/URLs sont cités selon le modèle (GPT-5 cite-t-il les mêmes sources que Gemini ?).
+
+Utile pour :
+- Identifier quels sites sont les plus cités dans les réponses LLM
+- Comparer les sources entre modèles (gpt-interface vs sonar-pro vs gemini)
+- Analyser l'évolution des citations dans le temps (passer deux périodes différentes)
+
+**Paramètres :**
+| Paramètre | Requis | Description |
+|-----------|--------|-------------|
+| `domainId` | ✅ | ID du domaine |
+| `topicId` | ✅ | ID du topic |
+| `startDate` | optionnel | Date début YYYY-MM-DD (défaut : -90 jours) |
+| `endDate` | optionnel | Date fin YYYY-MM-DD (défaut : aujourd'hui) |
+| `models` | optionnel | Filtre modèles séparés par virgule (défaut : tous) |
+
+**Retour :**
+```json
+{
+  "status": "success",
+  "data": {
+    "top_domains": [
+      {"Model": "GLOBAL",  "Domain": "booking.com",  "CitationCount": 142, "Rank": 1},
+      {"Model": "gpt-5",   "Domain": "booking.com",  "CitationCount": 87,  "Rank": 1},
+      {"Model": "sonar-pro","Domain": "tripadvisor.com","CitationCount": 54,"Rank": 1}
+    ],
+    "top_urls": [
+      {"Model": "GLOBAL", "Url": "https://booking.com/...", "Domain": "booking.com", "CitationCount": 23, "Rank": 1}
+    ],
+    "domains_over_time": [
+      {"Model": "GLOBAL", "Date": "2026-01-15", "Domain": "booking.com", "Count": 12}
+    ],
+    "urls_over_time": [...],
+    "global_metrics": [
+      {"Model": "GLOBAL", "TotalPrompts": 320, "TotalAnswers": 1280, "TotalCitations": 4200, "ReportCount": 8}
+    ],
+    "metadata": {
+      "models": ["GLOBAL", "gpt-5", "sonar-pro", "gemini-3-pro-preview", "gpt-interface"],
+      "startDate": "2026-01-01",
+      "endDate": "2026-01-31"
+    }
+  }
+}
+```
+
+**Exemple — comparer deux périodes :**
+```
+→ Appel 1 : startDate="2026-01-01" endDate="2026-01-15"
+→ Appel 2 : startDate="2026-01-16" endDate="2026-01-31"
+→ Comparer top_domains entre les deux résultats
+```
+
+---
 
 ## 📦 Installation
 
@@ -100,8 +155,6 @@ python mcp_mint_server.py
 
 ## 📊 Configuration Claude Desktop
 
-Ajouter dans `claude_desktop_config.json` :
-
 ```json
 {
   "mcpServers": {
@@ -116,58 +169,37 @@ Ajouter dans `claude_desktop_config.json` :
 }
 ```
 
-## 🧪 Test
-
-```bash
-# Installation
-pip install -r requirements.txt
-
-# Configuration
-export MINT_API_KEY="mint_live_..."
-
-# Lancement
-python mcp_mint_server.py
-```
-
 ## 📁 Structure du projet
 
 ```
 .
 ├── mcp_mint_server.py   # Serveur MCP principal
 ├── requirements.txt     # Dépendances
-└── README.md           # Cette documentation
+└── README.md            # Cette documentation
 ```
 
-## 🔄 Changelog
+## 📄 Changelog
 
-### v3.0.0 (2026-02-09)
-- ✅ Tool `get_domains_and_topics` : Liste domaines et topics
-- ✅ Tool `get_visibility_scores` : Dataset structuré complet
-- ✅ Format : Date | EntityName | EntityType | Score | Model | Variation
+### v3.5.0 (2026-02-20)
+- ✅ Tool `get_citations` : top domaines & URLs cités par les LLMs
+- ✅ 1 call GLOBAL + appels parallèles par modèle (`asyncio.gather`)
+- ✅ Retourne : top_domains, top_urls, domains_over_time, urls_over_time, global_metrics
+- ✅ Comparaison inter-modèles (gpt-interface vs sonar-pro vs gemini)
+- ✅ Comparaison temporelle via startDate/endDate
+
+### v3.4.0 (2026-02-09)
+- ✅ Extension historique par défaut à 365 jours
+- ✅ Limite de résultats augmentée à 1000 entrées
+- ✅ Correction erreur 405 sur `/sse`
+
+### v3.0.0 (2026-01-15)
+- ✅ Tool `get_domains_and_topics`
+- ✅ Tool `get_visibility_scores` avec dataset structuré
 - ✅ Support split par modèle LLM automatique
-- ✅ Brand + Competitors avec évolutions
 
-## 📊 Format du dataset
+## 🔑 Variables d'environnement
 
-**Colonnes** :
-1. `Date` - Date de la période (YYYY-MM-DD)
-2. `EntityName` - Nom de l'entité (Brand ou Competitor)
-3. `EntityType` - Type ("Brand" ou "Competitor")
-4. `Score` - Score de visibilité (0-100)
-5. `Model` - Modèle LLM ("GLOBAL" ou nom du modèle)
-6. `Variation_Points` - Évolution en points vs période précédente
-7. `Variation_Percent` - Évolution en % vs période précédente
-
-**Exemple d'utilisation** :
-- Analyser l'évolution de la marque sur GPT-5
-- Comparer Brand vs Competitors
-- Voir la tendance globale (GLOBAL)
-- Identifier les modèles où on performe le mieux
-
-## 🆘 Support
-
-Variables d'environnement requises :
-- `MINT_API_KEY` : Votre clé API Mint.ai
-
-Variables optionnelles :
-- `MINT_BASE_URL` : URL de l'API (défaut: https://api.getmint.ai/api)
+| Variable | Requis | Description |
+|----------|--------|-------------|
+| `MINT_API_KEY` | ✅ | Clé API Mint.ai |
+| `MINT_BASE_URL` | optionnel | URL de base (défaut : `https://api.getmint.ai/api`) |
