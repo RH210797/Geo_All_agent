@@ -1,5 +1,5 @@
 """
-Mint.ai Visibility MCP Server - Version 3.4.0 (Extended Historical Data)
+Mint.ai Visibility MCP Server - Version 3.5.0 (Citations Explorer)
 
 Serveur MCP (Model Context Protocol) permettant d'accéder aux données de visibilité
 de marques via l'API Mint.ai. Compatible avec les clients MCP standards (Claude Desktop)
@@ -10,6 +10,12 @@ Fonctionnalités principales:
 - Extraction des scores de visibilité avec historique étendu (365 jours par défaut)
 - Support de multiples modèles d'IA (GPT, Gemini, Sonar, etc.)
 - Format de données structuré pour l'analyse comparative
+- Récupération des citations paginées avec agrégation par domaine source
+
+Modifications version 3.5.0:
+- Ajout du tool get_citations : récupération des sources citées par les LLMs dans les prompts
+- Agrégation automatique : comptage du nombre de mentions par domaine source (moins de lignes)
+- Paramètres de filtrage : modèle, catégorie de prompt, pagination
 
 Modifications version 3.4.0:
 - Extension de la période par défaut de 30 à 365 jours d'historique
@@ -256,6 +262,158 @@ async def get_visibility_scores(domainId: str, topicId: str, startDate: str = No
 
     return {"status": "success", "data": {"dataset": dataset, "metadata": {"models": ["GLOBAL"] + available_models}}}
 
+
+async def get_citations(
+    domainId: str,
+    topicId: str,
+    startDate: str = None,
+    endDate: str = None,
+    models: str = None,
+) -> dict:
+    """
+    Récupère les top domaines et top URLs cités pour un topic donné,
+    en bouclant sur chaque modèle disponible (même logique que get_visibility_scores).
+
+    Utilise l'endpoint visibility/aggregated avec includeDetailedResults=true
+    qui retourne directement topDomains, topCitedUrls, topDomainsOverTime, etc.
+    → Pas de pagination, 1 seul call par modèle.
+
+    Args:
+        domainId:   ID du domaine (REQUIS)
+        topicId:    ID du topic (REQUIS)
+        startDate:  Date début YYYY-MM-DD (défaut: aujourd'hui - 90j)
+        endDate:    Date fin   YYYY-MM-DD (défaut: aujourd'hui)
+        models:     Modèles à inclure, séparés par virgule (optionnel, défaut: tous)
+
+    Returns:
+        dict avec :
+          - top_domains  : [{Model, Domain, CitationCount, Rank}, ...]
+          - top_urls     : [{Model, Url, Domain, CitationCount, Rank}, ...]
+          - domains_over_time : [{Model, Date, Domain, Count}, ...]
+          - urls_over_time    : [{Model, Date, Url, Count}, ...]
+          - global_metrics    : [{Model, TotalPrompts, TotalAnswers, TotalCitations, ReportCount}, ...]
+    """
+    if not startDate or not endDate:
+        endDate   = date.today().strftime("%Y-%m-%d")
+        startDate = (date.today() - timedelta(days=90)).strftime("%Y-%m-%d")
+
+    base_params = {
+        "startDate":              startDate,
+        "endDate":                endDate,
+        "includeDetailedResults": "true",
+        "latestOnly":             "false",
+        "page":                   "1",
+        "limit":                  "1000",  # max pour récupérer tous les top domaines/URLs sans troncature
+    }
+
+    endpoint = f"/domains/{domainId}/topics/{topicId}/visibility/aggregated"
+
+    # ── Récupération GLOBAL + liste des modèles disponibles ──────────────────
+    global_data      = await fetch_api(endpoint, base_params)
+    available_models = global_data.get("availableModels", [])
+
+    # Filtre optionnel sur les modèles
+    if models:
+        requested = [m.strip() for m in models.split(",")]
+        available_models = [m for m in available_models if m in requested]
+
+    # ── Récupération par modèle en parallèle ─────────────────────────────────
+    async def fetch_model(m):
+        try:
+            return m, await fetch_api(endpoint, {**base_params, "models": m})
+        except Exception:
+            return m, None
+
+    tasks = [fetch_model(m) for m in available_models]
+    model_results = await asyncio.gather(*tasks)
+    by_model = {m: d for m, d in model_results if d is not None}
+
+    # ── Extraction helper ─────────────────────────────────────────────────────
+    def extract(data, model_name):
+        top_domains, top_urls, domains_ot, urls_ot, metrics = [], [], [], [], []
+
+        # topDomains
+        for i, item in enumerate(data.get("topDomains", []), 1):
+            top_domains.append({
+                "Model":         model_name,
+                "Domain":        item.get("domain", item.get("linkDomain", "")),
+                "CitationCount": item.get("count",  item.get("citationCount", 0)),
+                "Rank":          i,
+            })
+
+        # topCitedUrls
+        for i, item in enumerate(data.get("topCitedUrls", []), 1):
+            top_urls.append({
+                "Model":         model_name,
+                "Url":           item.get("url",    item.get("link", "")),
+                "Domain":        item.get("domain", item.get("linkDomain", "")),
+                "CitationCount": item.get("count",  item.get("citationCount", 0)),
+                "Rank":          i,
+            })
+
+        # topDomainsOverTime
+        for entry in data.get("topDomainsOverTime", []):
+            for domain, count in entry.get("domains", {}).items():
+                domains_ot.append({
+                    "Model":  model_name,
+                    "Date":   entry.get("date", ""),
+                    "Domain": domain,
+                    "Count":  count,
+                })
+
+        # topUrlsOverTime
+        for entry in data.get("topUrlsOverTime", []):
+            for url, count in entry.get("urls", {}).items():
+                urls_ot.append({
+                    "Model": model_name,
+                    "Date":  entry.get("date", ""),
+                    "Url":   url,
+                    "Count": count,
+                })
+
+        # global metrics
+        metrics.append({
+            "Model":         model_name,
+            "TotalPrompts":  data.get("totalPromptsTested", 0),
+            "TotalAnswers":  data.get("totalAnswers",        0),
+            "TotalCitations":data.get("totalCitations",     0),
+            "ReportCount":   data.get("reportCount",        0),
+        })
+
+        return top_domains, top_urls, domains_ot, urls_ot, metrics
+
+    # ── Assemblage du dataset final ───────────────────────────────────────────
+    all_top_domains, all_top_urls, all_domains_ot, all_urls_ot, all_metrics = [], [], [], [], []
+
+    # GLOBAL d'abord
+    td, tu, dot, uot, met = extract(global_data, "GLOBAL")
+    all_top_domains  += td;  all_top_urls    += tu
+    all_domains_ot   += dot; all_urls_ot     += uot
+    all_metrics      += met
+
+    # Puis chaque modèle
+    for m, data in by_model.items():
+        td, tu, dot, uot, met = extract(data, m)
+        all_top_domains  += td;  all_top_urls    += tu
+        all_domains_ot   += dot; all_urls_ot     += uot
+        all_metrics      += met
+
+    return {
+        "status": "success",
+        "data": {
+            "top_domains":      all_top_domains,
+            "top_urls":         all_top_urls,
+            "domains_over_time":all_domains_ot,
+            "urls_over_time":   all_urls_ot,
+            "global_metrics":   all_metrics,
+            "metadata": {
+                "models": ["GLOBAL"] + list(by_model.keys()),
+                "startDate": startDate,
+                "endDate":   endDate,
+            },
+        },
+    }
+
 # ========== ENREGISTREMENT DES OUTILS MCP ==========
 
 @server.list_tools()
@@ -294,6 +452,21 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["domainId", "topicId"]
             }
+        ),
+        Tool(
+            name="get_citations",
+            description="🔗 Récupère les top domaines et top URLs cités par les LLMs, par modèle. Boucle sur tous les modèles disponibles (GLOBAL + GPT-5, Gemini, Sonar...). Retourne: top_domains, top_urls, domains_over_time, urls_over_time, global_metrics. Paramètres optionnels: startDate/endDate (YYYY-MM-DD, défaut 90j), models (séparés par virgule).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "domainId":  {"type": "string", "description": "ID du domaine (REQUIS)"},
+                    "topicId":   {"type": "string", "description": "ID du topic (REQUIS)"},
+                    "startDate": {"type": "string", "description": "Date début YYYY-MM-DD (optionnel, défaut: aujourd'hui - 90 jours)"},
+                    "endDate":   {"type": "string", "description": "Date fin YYYY-MM-DD (optionnel, défaut: aujourd'hui)"},
+                    "models":    {"type": "string", "description": "Modèles à inclure, séparés par virgule (optionnel, défaut: tous)"},
+                },
+                "required": ["domainId", "topicId"]
+            }
         )
     ]
 
@@ -324,6 +497,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         elif name == "get_visibility_scores":
             # Expansion des arguments du dictionnaire comme paramètres nommés
             res = await get_visibility_scores(**arguments)
+        elif name == "get_citations":
+            res = await get_citations(**arguments)
         else:
             raise ValueError(f"Unknown tool: {name}")
         
