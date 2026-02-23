@@ -1,5 +1,5 @@
 """
-Mint.ai Visibility MCP Server - Version 3.5.0 (Citations Explorer)
+Mint.ai Visibility MCP Server - Version 3.6.0 (Visibility Monthly Summary)
 
 Serveur MCP (Model Context Protocol) permettant d'accéder aux données de visibilité
 de marques via l'API Mint.ai. Compatible avec les clients MCP standards (Claude Desktop)
@@ -11,6 +11,12 @@ Fonctionnalités principales:
 - Support de multiples modèles d'IA (GPT, Gemini, Sonar, etc.)
 - Format de données structuré pour l'analyse comparative
 - Récupération des citations paginées avec agrégation par domaine source
+
+Modifications version 3.6.0:
+- Ajout du tool get_visibility_monthly_summary : agrégation multi-topics sur une période mensuelle
+- Itération parallèle sur tous les domaines/topics avec filtres optionnels brand/market/models
+- Calcul de la moyenne de averageScore via l'endpoint /visibility (reports bruts)
+- Retourne un tableau Markdown structuré trié par brand et score
 
 Modifications version 3.5.0:
 - Ajout du tool get_citations : récupération des sources citées par les LLMs dans les prompts
@@ -414,6 +420,159 @@ async def get_citations(
         },
     }
 
+async def get_visibility_monthly_summary(
+    startDate: str = None,
+    endDate: str = None,
+    models: str = None,
+    brand_filter: str = None,
+    market_filter: str = None,
+) -> dict:
+    """
+    Récupère et agrège les scores de visibilité moyens pour PLUSIEURS topics
+    sur une période, en un seul appel. Itère côté serveur topic par topic.
+
+    Le tool est autonome : il récupère lui-même la liste des topics via
+    get_domains_and_topics, applique les filtres optionnels, puis appelle
+    l'endpoint /visibility pour chaque topic individuellement (1 call API
+    par topic) et compile les résultats en un tableau Markdown compact.
+
+    Retourne uniquement le score moyen par topic — sans historique jour par
+    jour, sans concurrents, sans décomposition par modèle — pour minimiser
+    les tokens consommés.
+
+    À utiliser quand l'utilisateur veut une vue synthétique comparative sur
+    plusieurs topics/brands/marchés sur une période.
+    NE PAS utiliser pour zoomer sur 1 topic (Brand vs Concurrents, historique
+    détaillé) → utiliser get_visibility_scores à la place.
+
+    Args:
+        startDate:      Date début YYYY-MM-DD (optionnel, défaut: aujourd'hui - 90j)
+        endDate:        Date fin   YYYY-MM-DD (optionnel, défaut: aujourd'hui)
+        models:         Modèle(s) à filtrer, séparés par virgule (optionnel).
+                        Ex: "gpt-5.1" ou "gpt-5.1,sonar-pro"
+                        Si omis → averageScore cross-modèles calculé par Mint.
+                        Disponibles: gpt-5.1, sonar-pro, google-ai-overview,
+                                     gpt-interface, gemini-3-pro-preview
+        brand_filter:   Filtrer par brand (optionnel). Ex: "IBIS", "Mercure"
+        market_filter:  Filtrer par marché dans le nom du topic (optionnel).
+                        Ex: "FR", "UK", "DE"
+
+    Returns:
+        dict avec:
+          - markdown_table : tableau Markdown compact prêt à afficher
+          - rows           : [{brand, topic, avg_score, data_points}, ...]
+          - metadata       : {startDate, endDate, models, topic_count}
+    """
+    if not startDate or not endDate:
+        endDate   = date.today().strftime("%Y-%m-%d")
+        startDate = (date.today() - timedelta(days=90)).strftime("%Y-%m-%d")
+
+    # ── 1. Récupérer tous les topics disponibles ─────────────────────────────
+    catalog    = await get_domains_and_topics()
+    all_topics = catalog.get("data", {}).get("topics", [])
+
+    # ── 2. Appliquer les filtres optionnels ──────────────────────────────────
+    if brand_filter:
+        all_topics = [t for t in all_topics if brand_filter.upper() in t.get("domainName", "").upper()]
+    if market_filter:
+        all_topics = [t for t in all_topics if market_filter.upper() in t.get("name", "").upper()]
+
+    if not all_topics:
+        return {"status": "error", "message": f"Aucun topic trouvé avec brand_filter='{brand_filter}' market_filter='{market_filter}'"}
+
+    # ── 3. Fetch /visibility pour chaque topic — 1 call API par topic ────────
+    params = {"limit": 100, "startDate": startDate, "endDate": endDate}
+    if models:
+        params["models"] = models
+
+    async def fetch_one(topic):
+        try:
+            data = await fetch_api(
+                f"/domains/{topic['domainId']}/topics/{topic['id']}/visibility",
+                params,
+            )
+            return topic, data, None
+        except Exception as e:
+            return topic, None, str(e)
+
+    # Batches de 8 appels parallèles pour ne pas saturer l'API
+    all_results = []
+    batch_size  = 8
+    for i in range(0, len(all_topics), batch_size):
+        batch   = all_topics[i : i + batch_size]
+        results = await asyncio.gather(*[fetch_one(t) for t in batch])
+        all_results.extend(results)
+        if i + batch_size < len(all_topics):
+            await asyncio.sleep(0.3)
+
+    # ── 4. Calculer la moyenne de averageScore par topic ─────────────────────
+    def score_emoji(s):
+        if s is None: return "⚠️"
+        if s >= 60:   return "🟢"
+        if s >= 40:   return "🟡"
+        if s >= 20:   return "🟠"
+        return "🔴"
+
+    rows = []
+    for topic, data, error in all_results:
+        if error:
+            rows.append({"brand": topic.get("domainName", "?"), "topic": topic.get("name", "?"),
+                         "avg_score": None, "data_points": 0, "error": error})
+            continue
+
+        scores = [
+            float(rep["averageScore"])
+            for rep in data.get("reports", [])
+            if rep.get("averageScore") is not None
+        ]
+        avg = round(sum(scores) / len(scores), 1) if scores else None
+        rows.append({"brand": topic.get("domainName", "?"), "topic": topic.get("name", "?"),
+                     "avg_score": avg, "data_points": len(scores), "error": None})
+
+    rows.sort(key=lambda r: (r["brand"], -(r["avg_score"] or -1)))
+
+    # ── 5. Générer le tableau Markdown compact ───────────────────────────────
+    filter_info = ""
+    if brand_filter:  filter_info += f" | brand: {brand_filter}"
+    if market_filter: filter_info += f" | marché: {market_filter}"
+    if models:        filter_info += f" | modèles: {models}"
+
+    lines = [
+        f"## 📊 Scores moyens — {startDate} → {endDate}",
+        f"*{len(rows)} topics{filter_info}*",
+        "",
+        "| Brand | Topic | Score moy. | N reports | Statut |",
+        "|-------|-------|:----------:|:---------:|--------|",
+    ]
+    prev_brand = None
+    for r in rows:
+        brand_d    = r["brand"] if r["brand"] != prev_brand else ""
+        prev_brand = r["brand"]
+        score_str  = f"**{r['avg_score']}**" if r["avg_score"] is not None else "—"
+        status     = score_emoji(r["avg_score"]) if not r["error"] else f"❌ {r['error'][:30]}"
+        lines.append(f"| {brand_d} | {r['topic']} | {score_str} | {r['data_points']} | {status} |")
+
+    valid = [r["avg_score"] for r in rows if r["avg_score"] is not None]
+    if valid:
+        g_avg  = round(sum(valid) / len(valid), 1)
+        best   = max(rows, key=lambda r: r["avg_score"] or -1)
+        worst  = min(rows, key=lambda r: r["avg_score"] if r["avg_score"] is not None else 9999)
+        lines += [
+            "",
+            "---",
+            f"**Moyenne globale :** {g_avg} | **Meilleur :** {best['topic']} ({best['avg_score']}) | **Plus bas :** {worst['topic']} ({worst['avg_score']})",
+            "_🟢 ≥60 | 🟡 40–59 | 🟠 20–39 | 🔴 <20 | ⚠️ no data_",
+        ]
+
+    return {
+        "status":         "success",
+        "markdown_table": "\n".join(lines),
+        "rows":           rows,
+        "metadata":       {"startDate": startDate, "endDate": endDate,
+                           "models": models or "all (cross-models)", "topic_count": len(rows)},
+    }
+
+
 # ========== ENREGISTREMENT DES OUTILS MCP ==========
 
 @server.list_tools()
@@ -440,7 +599,15 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_visibility_scores",
-            description="📈 Récupère les scores de visibilité en dataset tabulaire. Paramètres optionnels: startDate/endDate (YYYY-MM-DD), models (GLOBAL,gpt-5.1,sonar-pro,google-ai-overview,gpt-interface,gemini-3-pro-preview,gpt-5). Si omis → retour complet.",
+            description=(
+                "📈 Récupère les scores de visibilité détaillés pour UN topic spécifique : "
+                "historique jour par jour, scores Brand vs Concurrents, décomposition par modèle IA. "
+                "À utiliser quand la question porte sur UN topic précis (ex: 'montre-moi l'évolution "
+                "d'IBIS FR sur 3 mois', 'compare Brand vs concurrents sur Novotel UK'). "
+                "Paramètres optionnels: startDate/endDate (YYYY-MM-DD), "
+                "models (GLOBAL,gpt-5.1,sonar-pro,google-ai-overview,gpt-interface,gemini-3-pro-preview,gpt-5). "
+                "Si omis → retour complet 365 jours tous modèles."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -466,6 +633,35 @@ async def list_tools() -> list[Tool]:
                     "models":    {"type": "string", "description": "Modèles à inclure, séparés par virgule (optionnel, défaut: tous)"},
                 },
                 "required": ["domainId", "topicId"]
+            }
+        ),
+        Tool(
+            name="get_visibility_monthly_summary",
+            description=(
+                "📊 Tableau synthétique des scores moyens de visibilité pour PLUSIEURS topics. "
+                "Le tool est AUTONOME : il récupère lui-même tous les topics disponibles, "
+                "boucle dessus côté serveur (1 call API par topic), et retourne un tableau "
+                "Markdown compact avec le score moyen par topic — sans historique, sans "
+                "concurrents, sans décomposition par modèle. Économise les tokens vs appels multiples. "
+                "À utiliser quand l'utilisateur veut une vue comparative sur plusieurs topics/brands "
+                "(ex: 'score moyen de tous les marchés IBIS sur janvier', "
+                "'compare toutes les brands sur Q1 2026', 'synthèse globale de la visibilité'). "
+                "Filtres optionnels : brand_filter (ex: 'IBIS'), market_filter (ex: 'FR'). "
+                "NE PAS utiliser pour zoomer sur 1 topic avec détail Brand vs Concurrents "
+                "→ utiliser get_visibility_scores. "
+                "Modèles: gpt-5.1, sonar-pro, google-ai-overview, gpt-interface, gemini-3-pro-preview. "
+                "Si models omis → averageScore cross-modèles."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "startDate":     {"type": "string", "description": "Date début YYYY-MM-DD (optionnel, défaut: aujourd'hui - 90 jours)"},
+                    "endDate":       {"type": "string", "description": "Date fin YYYY-MM-DD (optionnel, défaut: aujourd'hui)"},
+                    "models":        {"type": "string", "description": "Modèle(s) séparés par virgule (optionnel). Ex: 'gpt-5.1,sonar-pro'. Si omis → cross-modèles."},
+                    "brand_filter":  {"type": "string", "description": "Filtrer par brand (optionnel). Ex: 'IBIS', 'Mercure', 'Fairmont'"},
+                    "market_filter": {"type": "string", "description": "Filtrer par marché dans le nom du topic (optionnel). Ex: 'FR', 'UK', 'DE'"},
+                },
+                "required": []
             }
         )
     ]
@@ -499,6 +695,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             res = await get_visibility_scores(**arguments)
         elif name == "get_citations":
             res = await get_citations(**arguments)
+        elif name == "get_visibility_monthly_summary":
+            res = await get_visibility_monthly_summary(**arguments)
         else:
             raise ValueError(f"Unknown tool: {name}")
         
