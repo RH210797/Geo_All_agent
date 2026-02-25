@@ -198,75 +198,64 @@ async def get_visibility_scores(domainId: str, topicId: str, startDate: str = No
         permettrait de paralléliser ces requêtes et d'améliorer significativement les performances
         lorsque de nombreux modèles sont disponibles.
     """
-    # Si aucune date n'est spécifiée, on utilise les 365 derniers jours par défaut
-    # Cette période étendue (vs 30 jours en v3.3.0) permet des analyses de tendances robustes
     if not startDate or not endDate:
-        endDate = date.today().strftime("%Y-%m-%d")
+        endDate   = date.today().strftime("%Y-%m-%d")
         startDate = (date.today() - timedelta(days=365)).strftime("%Y-%m-%d")
-    
-    # Paramètres de base pour toutes les requêtes API
-    # - latestOnly=false: Récupère l'historique complet, pas seulement le dernier snapshot
-    # - page=1: Pagination (non utilisée actuellement, mais pourrait être implémentée)
-    # - limit=1000: Nombre maximum de points de données (augmenté de 100 à 1000 en v3.4.0)
-    base_params = {"startDate": startDate, "endDate": endDate, "latestOnly": "false", "page": "1", "limit": "1000"}
-    
-    # Récupération des données agrégées GLOBAL (tous modèles confondus)
-    # Cette requête retourne également la liste des modèles disponibles pour ce domaine/topic
-    global_data = await fetch_api(f"/domains/{domainId}/topics/{topicId}/visibility/aggregated", base_params)
-    available_models = global_data.get("availableModels", [])
-    
-    # Récupération des données par modèle individuel (GPT-5, Gemini, Sonar, etc.)
-    # ATTENTION: Cette boucle effectue des appels séquentiels qui pourraient être parallélisés
-    # avec asyncio.gather pour améliorer les performances
-    by_model_data = {}
-    for m in available_models:
-        try:
-            # Pour chaque modèle, on refait un appel avec le filtre "models" spécifique
-            by_model_data[m] = await fetch_api(f"/domains/{domainId}/topics/{topicId}/visibility/aggregated", {**base_params, "models": m})
-        except:
-            # Les erreurs sont ignorées silencieusement pour éviter qu'un modèle défaillant
-            # ne bloque l'intégralité de la récupération. Cependant, cela masque les problèmes.
-            pass
 
-    # Construction du dataset unifié au format structuré
-    # Chaque ligne représente un score (marque ou concurrent) à une date donnée pour un modèle
+    # includeDetailedResults volontairement ABSENT : uniquement chartData
+    # → pas de topDomains / topCitedUrls / detailedResults / domainSourceAnalysis
+    # → réponse légère. Pour analyser les sources → utiliser get_citations.
+    base_params = {
+        "startDate":  startDate,
+        "endDate":    endDate,
+        "latestOnly": "false",
+        "page":       "1",
+        "limit":      "1000",
+    }
+    endpoint = f"/domains/{domainId}/topics/{topicId}/visibility/aggregated"
+
+    # Call GLOBAL + tous les modèles en parallèle
+    global_data      = await fetch_api(endpoint, base_params)
+    available_models = global_data.get("availableModels", [])
+
+    if models:
+        requested        = [m.strip() for m in models.split(",")]
+        available_models = [m for m in available_models if m in requested]
+
+    async def fetch_model(m):
+        try:
+            return m, await fetch_api(endpoint, {**base_params, "models": m})
+        except Exception:
+            return m, None
+
+    model_results = await asyncio.gather(*[fetch_model(m) for m in available_models])
+    by_model_data = {m: d for m, d in model_results if d is not None}
+
+    # Extraction : uniquement chartData (Brand + Competitors scores dans le temps)
     dataset = []
-    
+
     def add_rows(data, model_name):
-        """
-        Fonction interne pour transformer les données chartData de l'API en lignes de dataset.
-        
-        Structure de chartData de l'API:
-        [
-            {
-                "date": "2026-01-13",
-                "brand": 50.76,
-                "competitors": {"Booking": 30, "B&B Hotels": 26, ...}
-            },
-            ...
-        ]
-        
-        Transformation en dataset:
-        - Une ligne pour la marque principale
-        - Une ligne pour chaque concurrent
-        - Toutes liées à la même date et au même modèle
-        """
         for entry in data.get("chartData", []):
             d = entry.get("date")
-            # Ajout du score de la marque principale
-            dataset.append({"Date": d, "EntityName": "Brand", "EntityType": "Brand", "Score": entry.get("brand"), "Model": model_name})
-            # Ajout des scores de tous les concurrents pour cette date
+            dataset.append({"Date": d, "EntityName": "Brand",  "EntityType": "Brand",      "Score": entry.get("brand"), "Model": model_name})
             for c_name, c_score in entry.get("competitors", {}).items():
-                dataset.append({"Date": d, "EntityName": c_name, "EntityType": "Competitor", "Score": c_score, "Model": model_name})
+                dataset.append({"Date": d, "EntityName": c_name, "EntityType": "Competitor", "Score": c_score,            "Model": model_name})
 
-    # Ajout des données GLOBAL (agrégées tous modèles)
     add_rows(global_data, "GLOBAL")
-    
-    # Ajout des données par modèle individuel
     for m, data in by_model_data.items():
         add_rows(data, m)
 
-    return {"status": "success", "data": {"dataset": dataset, "metadata": {"models": ["GLOBAL"] + available_models}}}
+    return {
+        "status": "success",
+        "data": {
+            "dataset":  dataset,
+            "metadata": {
+                "models":    ["GLOBAL"] + list(by_model_data.keys()),
+                "startDate": startDate,
+                "endDate":   endDate,
+            },
+        },
+    }
 
 
 async def get_citations(
@@ -588,8 +577,10 @@ async def list_tools() -> list[Tool]:
         list[Tool]: Liste des outils MCP avec leurs schémas de validation
     
     Outils disponibles:
-        1. get_domains_and_topics: Exploration de la hiérarchie domaines/topics
-        2. get_visibility_scores: Récupération des données de visibilité avec historique
+        1. get_domains_and_topics:          Exploration de la hiérarchie domaines/topics
+        2. get_visibility_scores:           Analyse 1 topic : Brand vs Competitors + par modèle + historique
+        3. get_citations:                   Top domaines & URLs cités, 1 topic, focus sources
+        4. get_visibility_monthly_summary:  Vue multi-topics : score Brand moyen + breakdown par modèle
     """
     return [
         Tool(
@@ -600,29 +591,39 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="get_visibility_scores",
             description=(
-                "📈 Récupère les scores de visibilité détaillés pour UN topic spécifique : "
-                "historique jour par jour, scores Brand vs Concurrents, décomposition par modèle IA. "
-                "À utiliser quand la question porte sur UN topic précis (ex: 'montre-moi l'évolution "
-                "d'IBIS FR sur 3 mois', 'compare Brand vs concurrents sur Novotel UK'). "
-                "Paramètres optionnels: startDate/endDate (YYYY-MM-DD), "
-                "models (GLOBAL,gpt-5.1,sonar-pro,google-ai-overview,gpt-interface,gemini-3-pro-preview,gpt-5). "
-                "Si omis → retour complet 365 jours tous modèles."
+                "📈 Analyse détaillée d'UN topic : historique jour par jour des scores Brand vs Competitors, "
+                "décomposition par modèle IA. Calls modèles en parallèle (asyncio.gather). "
+                "✅ Utiliser pour : évolution Brand vs Competitors sur une période, "
+                "comparer les scores par modèle (gpt-5.1 vs gemini vs sonar), "
+                "zoom sur 1 topic précis avec historique complet. "
+                "❌ Ne PAS utiliser pour une vue multi-topics → get_visibility_monthly_summary. "
+                "❌ Ne PAS utiliser pour analyser les sources/domaines cités → get_citations. "
+                "Modèles: GLOBAL, gpt-5.1, sonar-pro, google-ai-overview, gpt-interface, gemini-3-pro-preview, gpt-5."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "domainId": {"type": "string", "description": "ID du domaine (REQUIS)"},
-                    "topicId": {"type": "string", "description": "ID du topic (REQUIS)"},
-                    "startDate": {"type": "string", "description": "Date début YYYY-MM-DD (optionnel)"},
-                    "endDate": {"type": "string", "description": "Date fin YYYY-MM-DD (optionnel)"},
-                    "models": {"type": "string", "description": "Modèles à filtrer (optionnel, séparés par virgule)"}
+                    "domainId":  {"type": "string", "description": "ID du domaine (REQUIS)"},
+                    "topicId":   {"type": "string", "description": "ID du topic (REQUIS)"},
+                    "startDate": {"type": "string", "description": "Date début YYYY-MM-DD (optionnel, défaut: -365 jours)"},
+                    "endDate":   {"type": "string", "description": "Date fin YYYY-MM-DD (optionnel, défaut: aujourd'hui)"},
+                    "models":    {"type": "string", "description": "Modèles à filtrer, séparés par virgule (optionnel)"},
                 },
                 "required": ["domainId", "topicId"]
             }
         ),
         Tool(
             name="get_citations",
-            description="🔗 Récupère les top domaines et top URLs cités par les LLMs, par modèle. Boucle sur tous les modèles disponibles (GLOBAL + GPT-5, Gemini, Sonar...). Retourne: top_domains, top_urls, domains_over_time, urls_over_time, global_metrics. Paramètres optionnels: startDate/endDate (YYYY-MM-DD, défaut 90j), models (séparés par virgule).",
+            description=(
+                "🔗 Top domaines & URLs cités par les LLMs dans leurs réponses, par modèle IA. "
+                "1 call GLOBAL + 1 call par modèle en parallèle (includeDetailedResults=true). "
+                "✅ Utiliser pour : quelles sources sont citées dans les réponses LLM, "
+                "comparer les domaines entre modèles (gpt-interface vs sonar-pro vs gemini), "
+                "évolution des citations dans le temps — toujours sur UN topic précis. "
+                "❌ Ne PAS utiliser pour les scores de visibilité → get_visibility_summary. "
+                "❌ Ne PAS utiliser pour une vue multi-topics → get_visibility_monthly_summary. "
+                "Retourne : top_domains, top_urls, domains_over_time, urls_over_time, global_metrics."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -638,19 +639,19 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="get_visibility_monthly_summary",
             description=(
-                "📊 Tableau synthétique des scores moyens de visibilité pour PLUSIEURS topics. "
-                "Le tool est AUTONOME : il récupère lui-même tous les topics disponibles, "
-                "boucle dessus côté serveur (1 call API par topic), et retourne un tableau "
-                "Markdown compact avec le score moyen par topic — sans historique, sans "
-                "concurrents, sans décomposition par modèle. Économise les tokens vs appels multiples. "
-                "À utiliser quand l'utilisateur veut une vue comparative sur plusieurs topics/brands "
-                "(ex: 'score moyen de tous les marchés IBIS sur janvier', "
-                "'compare toutes les brands sur Q1 2026', 'synthèse globale de la visibilité'). "
-                "Filtres optionnels : brand_filter (ex: 'IBIS'), market_filter (ex: 'FR'). "
-                "NE PAS utiliser pour zoomer sur 1 topic avec détail Brand vs Concurrents "
-                "→ utiliser get_visibility_scores. "
-                "Modèles: gpt-5.1, sonar-pro, google-ai-overview, gpt-interface, gemini-3-pro-preview. "
-                "Si models omis → averageScore cross-modèles."
+                "📊 OUTIL MULTI-TOPICS — Vue synthétique des scores moyens de visibilité Brand "
+                "sur plusieurs topics en un seul appel. AUTONOME : récupère lui-même tous les topics, "
+                "applique les filtres, et retourne un tableau Markdown compact. "
+                "✅ Utiliser pour : comparer N topics/brands/marchés sur une période, "
+                "synthèse globale ('score moyen de tous les marchés IBIS sur janvier'), "
+                "comparer toutes les brands sur Q1 2026, vue d'ensemble rapide. "
+                "Le paramètre models permet de filtrer sur un modèle précis pour voir le score "
+                "de ce modèle spécifique sur tous les topics (ex: models='gpt-5.1'). "
+                "❌ Ne PAS utiliser pour Brand vs Competitors → get_visibility_scores (1 topic). "
+                "❌ Ne PAS utiliser pour l'historique jour par jour → get_visibility_scores. "
+                "❌ Ne PAS utiliser pour analyser les sources/domaines → get_citations. "
+                "Filtres : brand_filter (ex: 'IBIS'), market_filter (ex: 'FR'). "
+                "Modèles: gpt-5.1, sonar-pro, google-ai-overview, gpt-interface, gemini-3-pro-preview."
             ),
             inputSchema={
                 "type": "object",
@@ -691,7 +692,6 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         if name == "get_domains_and_topics":
             res = await get_domains_and_topics()
         elif name == "get_visibility_scores":
-            # Expansion des arguments du dictionnaire comme paramètres nommés
             res = await get_visibility_scores(**arguments)
         elif name == "get_citations":
             res = await get_citations(**arguments)
