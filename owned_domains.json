@@ -1,0 +1,11 @@
+{
+  "_comment": "Mapping brand (domain.displayName Mint) → domaines propriétaires. Utilisé pour classifier une URL comme 'owned' vs 'external'. Le fallback _default s'applique aux brands non listées.",
+  "IBIS":     ["accor.com"],
+  "Mercure":  ["accor.com"],
+  "Novotel":  ["accor.com"],
+  "Pullman":  ["accor.com"],
+  "Sofitel":  ["accor.com"],
+  "Raffles":  ["accor.com", "raffles.com"],
+  "Fairmont": ["accor.com", "fairmont.com"],
+  "_default": ["accor.com"]
+}
