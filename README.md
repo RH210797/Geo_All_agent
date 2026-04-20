@@ -1,328 +1,183 @@
-# 🚀 Mint.ai Visibility MCP Server
+# Mint.ai Visibility MCP Server
 
-Serveur MCP pour analyser la visibilité de marque dans les LLMs via l'API Mint.ai.
+MCP server for analyzing brand visibility in LLM responses via the Mint.ai API.
 
-**Version 4.0.0** — Classification 2 axes des sources (ownership + brand_status), courbe temporelle binnée, et couplage strict (reportId, url) pour l'enrichment.
-
----
-
-## 🛠️ Tools disponibles (7)
+**Version 4.1.0** — Hardened & Optimized: persistent HTTP client, input validation, prefixed tool names, tool annotations, English docs.
 
 ---
 
-### 1. `get_domains_and_topics`
+## Tools (7)
 
-Liste tous les domaines et topics disponibles. **À utiliser en premier** pour récupérer les IDs nécessaires aux autres tools.
+---
 
-**Exemples d'utilisation :**
-- "Quels domaines j'ai ?"
-- "Liste mes topics"
+### 1. `mint_get_domains_and_topics`
 
-**Retour :**
+Lists all domains (brands) and topics (markets). **Call first** to get IDs needed by other tools.
+
+| Annotation | Value |
+|---|---|
+| readOnlyHint | true |
+| idempotentHint | true |
+
+**Examples:** "What brands do I have?", "List my topics"
+
+**Returns:**
 ```json
 {
   "domains": [...],
-  "topics": [...],
-  "mapping": {
-    "IBIS > IBIS FR": {
-      "domainId": "694a...",
-      "topicId": "694a..."
-    }
-  },
+  "topics": [{"domainId": "...", "domainName": "IBIS", "topicId": "...", "topicName": "IBIS FR"}],
+  "mapping": {"IBIS > IBIS FR": {"domainId": "694a...", "topicId": "694a..."}},
   "errors": []
 }
 ```
 
 ---
 
-### 2. `get_topic_scores`
+### 2. `mint_get_topic_scores`
 
-Scores de visibilité Brand + Competitors, par modèle LLM, sur une période donnée.
+Day-by-day Brand vs Competitors scores for **one topic**, broken down by AI model.
 
-À utiliser pour **zoomer sur UN topic précis** : historique jour par jour, Brand vs Concurrents, décomposition par modèle.
+| Param | Required | Description |
+|---|---|---|
+| `domainId` | yes | Domain ID |
+| `topicId` | yes | Topic ID |
+| `startDate` | no | YYYY-MM-DD (default: -30 days) |
+| `endDate` | no | YYYY-MM-DD (default: today) |
+| `models` | no | Comma-separated filter (e.g. `gpt-5.1,sonar-pro`) |
 
-**Paramètres :**
-| Paramètre | Requis | Description |
-|-----------|--------|-------------|
-| `domainId` | ✅ | ID du domaine |
-| `topicId` | ✅ | ID du topic |
-| `startDate` | optionnel | Date début YYYY-MM-DD (défaut : -30 jours) |
-| `endDate` | optionnel | Date fin YYYY-MM-DD (défaut : aujourd'hui) |
-| `models` | optionnel | Filtre modèles séparés par virgule |
-
-**Format du dataset retourné :**
-```
-Date | EntityName | EntityType | Score | Model
-```
-
-**Retour :**
-```json
-{
-  "status": "success",
-  "data": {
-    "dataset": [
-      { "Date": "2026-04-10", "EntityName": "Brand", "EntityType": "Brand", "Score": 64.14, "Model": "GLOBAL" },
-      { "Date": "2026-04-10", "EntityName": "Competitor A", "EntityType": "Competitor", "Score": 44.82, "Model": "gpt-5.1" }
-    ],
-    "metadata": {
-      "models": ["GLOBAL", "gpt-5.1", "sonar-pro", "gemini-3-pro-preview"]
-    }
-  }
-}
-```
+**Returns:** flat dataset `[{Date, EntityName, EntityType, Score, Model}, ...]`
 
 ---
 
-### 3. `get_scores_overview`
+### 3. `mint_get_scores_overview`
 
-Tableau synthétique des scores moyens de visibilité pour **PLUSIEURS topics en un seul appel**.
+Average visibility score for **multiple topics** in one call. Self-contained: fetches topics via filters.
 
-Le tool est **autonome** : il récupère lui-même tous les topics disponibles, boucle en parallèle côté serveur (semaphore globale à 8 requêtes simultanées), et retourne un tableau Markdown compact avec le score moyen par topic — sans historique, sans concurrents, sans décomposition par modèle.
+| Param | Required | Description |
+|---|---|---|
+| `brand_filter` | no | e.g. `IBIS`, `Mercure` |
+| `market_filter` | no | e.g. `FR`, `UK` |
+| `topic_ids` | no | Explicit topicId list |
+| `startDate` / `endDate` | no | Default: -90 days |
+| `models` | no | Comma-separated filter |
 
-Utile pour :
-- Vue comparative rapide multi-topics / multi-brands sur une période
-- Synthèse globale (ex: tous les marchés IBIS sur janvier)
-- Identifier les topics les plus et moins performants
-
-> ⚠️ Ne pas utiliser pour analyser Brand vs Concurrents ou l'historique détaillé → utiliser `get_topic_scores` à la place.
-
-**Paramètres :**
-| Paramètre | Requis | Description |
-|-----------|--------|-------------|
-| `startDate` | optionnel | Date début YYYY-MM-DD (défaut : -90 jours) |
-| `endDate` | optionnel | Date fin YYYY-MM-DD (défaut : aujourd'hui) |
-| `models` | optionnel | Filtre modèles séparés par virgule (défaut : cross-modèles) |
-| `brand_filter` | optionnel | Filtrer par brand (ex: `IBIS`, `Mercure`) |
-| `market_filter` | optionnel | Filtrer par marché dans le nom du topic (ex: `FR`, `UK`) |
-| `topic_ids` | optionnel | Liste explicite de topicIds |
-
-**Exemples d'utilisation :**
-```
-# Tous les topics, 90 derniers jours
-{}
-
-# Tous les marchés IBIS sur janvier 2026
-{ "brand_filter": "IBIS", "startDate": "2026-01-01", "endDate": "2026-01-31" }
-```
-
-**Retour — exemple de tableau Markdown :**
-```
-## 📊 Scores moyens — 2026-01-01 → 2026-01-31
-*36 topics*
-
-| Brand    | Topic       | Score moy. | N reports | Statut |
-|----------|-------------|:----------:|:---------:|--------|
-| Fairmont | Fairmont FR | **67.4**   | 13        | 🟢     |
-| IBIS     | IBIS FR     | **57.2**   | 12        | 🟡     |
-|          | IBIS UK     | **61.4**   | 11        | 🟢     |
-```
+**Returns:** Markdown table + JSON rows with avg scores per topic.
 
 ---
 
-### 4. `get_visibility_trend` *(nouveau v4)*
+### 4. `mint_get_visibility_trend`
 
-**Série temporelle binnée** (jour/semaine/mois) des scores de visibilité, prête à être affichée en line chart.
+**Binned time series** (day/week/month) for line charts.
 
-Quand tu reçois ce retour, tu dois **générer un graphique** dans un artifact Claude (Recharts, etc.).
+| Param | Required | Description |
+|---|---|---|
+| `brand_filter` / `market_filter` / `topic_ids` | no | Topic selection |
+| `startDate` / `endDate` | no | Default: Jan 1st current year to today |
+| `models` | no | Model filter |
+| `granularity` | no | `day` / `week` (default) / `month` |
+| `aggregation` | no | `average` (default) / `per_topic` |
 
-**Paramètres :**
-| Paramètre | Requis | Description |
-|-----------|--------|-------------|
-| `brand_filter` / `market_filter` / `topic_ids` | optionnel | Sélection des topics |
-| `startDate` / `endDate` | optionnel | Défaut : depuis le 1er janvier de l'année courante |
-| `models` | optionnel | Filtre modèles |
-| `granularity` | optionnel | `"day"` / `"week"` (défaut) / `"month"` |
-| `aggregation` | optionnel | `"average"` (défaut, 1 série moyennée) / `"per_topic"` (1 série par topic) |
-
-**Retour :**
+**Returns:**
 ```json
 {
-  "status": "success",
-  "series": [
-    {
-      "name": "IBIS (week avg)",
-      "points": [
-        { "date": "2026-01-06", "score": 52.3, "n": 45 },
-        { "date": "2026-01-13", "score": 55.1, "n": 48 }
-      ]
-    }
-  ],
+  "series": [{"name": "IBIS (week avg)", "points": [{"date": "2026-01-06", "score": 52.3, "n": 45}]}],
   "chart_hint": "line"
 }
 ```
 
 ---
 
-### 5. `get_topic_sources`
+### 5. `mint_get_topic_sources`
 
-Top domaines et URLs cités par les LLMs dans leurs réponses, par modèle. Utilise l'API `aggregated?includeDetailedResults=true` (agrégation côté Mint, plus rapide que reconstruction depuis les raw results).
+Top cited domains and URLs for **one topic**, per AI model. Uses Mint's pre-aggregated API (fast).
 
-Effectue **1 call GLOBAL + 1 call par modèle en parallèle** (`asyncio.gather`), ce qui permet de comparer quels domaines/URLs sont cités selon le modèle (GPT-5 cite-t-il les mêmes sources que Gemini ?).
+| Param | Required | Description |
+|---|---|---|
+| `domainId` | yes | Domain ID |
+| `topicId` | yes | Topic ID |
+| `startDate` / `endDate` | no | Default: -90 days |
+| `models` | no | Model filter |
 
-Utile pour :
-- Identifier quels sites sont les plus cités dans les réponses LLM
-- Comparer les sources entre modèles
-- Analyser l'évolution des citations dans le temps
+**Returns:** `top_domains`, `top_urls`, `domains_over_time`, `urls_over_time`, `global_metrics`
 
-**Paramètres :**
-| Paramètre | Requis | Description |
-|-----------|--------|-------------|
-| `domainId` | ✅ | ID du domaine |
-| `topicId` | ✅ | ID du topic |
-| `startDate` | optionnel | Date début (défaut : -90 jours) |
-| `endDate` | optionnel | Date fin (défaut : aujourd'hui) |
-| `models` | optionnel | Filtre modèles |
+---
 
-**Retour :**
+### 6. `mint_get_raw_responses` (core)
+
+Classifies every cited URL on **2 independent axes**:
+
+**Axis 1 — ownership** (domain regex):
+- `owned` — URL on a brand-owned domain (e.g. `all.accor.com`)
+- `external` — third-party domain (e.g. `booking.com`)
+
+**Axis 2 — brand_status** (via crawl enrichment):
+- `own_only` — page mentions your brand only
+- `own+comp` — page mentions your brand AND competitors
+- `comp_only` — page mentions only competitors
+- `no_brand` — crawl ran, no brand detected
+- `not_enriched` — no crawl data
+
+**3 modes** via `aggregate`:
+- `classified` (default) — full enrichment + classification + cross matrix
+- `sources` — top domains/URLs without enrichment (faster)
+- `none` — raw responses for drill-down
+
+| Param | Required | Description |
+|---|---|---|
+| `domainId` | yes | Domain ID |
+| `topic_ids` / `brand_filter` / `market_filter` | no | Topic selection |
+| `response_brand_mentioned` | no | `true` / `false` / `all` (default) |
+| `ownership_filter` | no | `owned` / `external` / `all` (default) |
+| `brand_status_filter` | no | String or list from the 5 statuses |
+| `aggregate` | no | `classified` / `sources` / `none` |
+| `top_n` | no | Max URLs (default: 30, max: 500) |
+
+**Example queries:**
 ```json
-{
-  "status": "success",
-  "data": {
-    "top_domains": [
-      { "Model": "GLOBAL",   "Domain": "booking.com",     "CitationCount": 142, "Rank": 1 },
-      { "Model": "gpt-5.1",  "Domain": "booking.com",     "CitationCount": 87,  "Rank": 1 },
-      { "Model": "sonar-pro","Domain": "tripadvisor.com", "CitationCount": 54,  "Rank": 1 }
-    ],
-    "top_urls": [...],
-    "domains_over_time": [...],
-    "global_metrics": [
-      { "Model": "GLOBAL", "TotalPrompts": 320, "TotalAnswers": 1280, "TotalCitations": 4200, "ReportCount": 8 }
-    ]
-  }
-}
+// "External sources mentioning my brand"
+{"domainId": "...", "ownership_filter": "external", "brand_status_filter": ["own_only", "own+comp"]}
+
+// "When IBIS is NOT cited, who takes my place?"
+{"domainId": "...", "response_brand_mentioned": "false", "aggregate": "sources"}
 ```
 
 ---
 
-### 6. `get_raw_responses` *(cœur v4)* 🎯
+### 7. `mint_enrich_sources`
 
-**Tool cœur** pour toutes les analyses fines de sources. Classifie chaque URL citée sur **2 axes indépendants** :
+Direct batch URL enrichment: DataForSEO category + detected brands.
 
-#### Axe 1 — `ownership` (via regex sur domaine)
-- `owned` = URL sur un domaine propriétaire (ex: `all.accor.com` pour IBIS)
-- `external` = URL sur un domaine tiers (booking.com, tripadvisor.com...)
+| Param | Required | Description |
+|---|---|---|
+| `domainId` | yes | Domain ID |
+| `urls` | yes | URL list (max 1000) |
+| `reportId` | yes | Report ID |
+| `topicId` | no | Resolves market/language |
+| `brand_name` | no | Adds owned/external classification |
 
-#### Axe 2 — `brand_status` (via API `/sources/enrichment`)
-- `own_only` = page mentionne ta marque uniquement
-- `own+comp` = page mentionne ta marque **et** des concurrents
-- `comp_only` = page mentionne uniquement des concurrents
-- `no_brand` = crawl a tourné mais rien détecté textuellement
-- `not_enriched` = pas de crawl disponible
-
-**3 modes via `aggregate` :**
-- `"classified"` (défaut) — enrichment + classification complète + matrice croisée
-- `"sources"` — top domaines/URLs sans enrichment (plus rapide)
-- `"none"` — responses brutes pour drill-down
-
-**Paramètres clés :**
-| Paramètre | Requis | Description |
-|-----------|--------|-------------|
-| `domainId` | ✅ | ID du domaine |
-| `topic_ids` / `brand_filter` / `market_filter` | optionnel | Sélection topics |
-| `response_brand_mentioned` | optionnel | `"true"` / `"false"` / `"all"` — filtre **niveau réponse LLM** |
-| `ownership_filter` | optionnel | Axe 1 : `"owned"` / `"external"` / `"all"` |
-| `brand_status_filter` | optionnel | Axe 2 : string ou liste parmi les 5 statuts |
-| `aggregate` | optionnel | Mode (défaut `"classified"`) |
-| `startDate` / `endDate` / `models` / `latestOnly` | optionnel | — |
-| `top_n` | optionnel | Nombre max URLs (défaut 30) |
-
-**Exemples d'utilisation :**
-
-```python
-# "Sources qui citent mes concurrents mais pas moi, quand IBIS est mentionné"
-{
-  "domainId": "...",
-  "topic_ids": ["..."],
-  "response_brand_mentioned": "true",
-  "brand_status_filter": "comp_only",
-  "ownership_filter": "external"
-}
-
-# "Sources externes qui mentionnent ma marque"
-{
-  "ownership_filter": "external",
-  "brand_status_filter": ["own_only", "own+comp"]
-}
-
-# "Quand IBIS n'est PAS cité, qui prend ma place ?"
-{
-  "response_brand_mentioned": "false",
-  "aggregate": "sources"
-}
-```
-
-**Retour (mode classified) :**
-```json
-{
-  "status": "success",
-  "classified_urls": [
-    {
-      "url": "https://booking.com/ibis-paris",
-      "domain": "booking.com",
-      "ownership": "external",
-      "brand_status": "own+comp",
-      "own_brands": ["IBIS"],
-      "comp_brands": ["Hilton"],
-      "own_count": 5,
-      "comp_count": 2,
-      "category": "Travel & Tourism > Booking Services",
-      "couples": "1/1"
-    }
-  ],
-  "matrix": [
-    { "ownership": "owned",    "own_only": 45, "own+comp": 12, "comp_only": 0,   "no_brand": 180, "not_enriched": 15, "TOTAL": 252 },
-    { "ownership": "external", "own_only": 32, "own+comp": 28, "comp_only": 120, "no_brand": 50,  "not_enriched": 200, "TOTAL": 430 }
-  ],
-  "metadata": {
-    "couples_enriched": 456,
-    "couples_total": 501,
-    "brand_name": "IBIS"
-  }
-}
-```
-
-> 🔒 **Couplage `(reportId, url)` respecté strictement** : chaque URL est enrichie avec SON reportId propre (pas de dédup cross-report). C'est le contract de l'API Mint — bug de la v3.x corrigé en v4.
+> For typical analysis, prefer `mint_get_raw_responses(aggregate="classified")`.
 
 ---
 
-### 7. `enrich_sources` *(nouveau v4)*
-
-Accès direct à l'endpoint `/sources/enrichment`. Pour une liste d'URLs + un `reportId`, retourne la catégorie DataForSEO et les brands détectées (isBrand=true → own, isBrand=false → competitor).
-
-Chunks automatiques à 100 URLs (limite API).
-
-**Paramètres :**
-| Paramètre | Requis | Description |
-|-----------|--------|-------------|
-| `domainId` | ✅ | ID du domaine |
-| `urls` | ✅ | Liste d'URLs à enrichir |
-| `reportId` | ✅ | Report ID source |
-| `topicId` | optionnel | Résout market/langue |
-| `brand_name` | optionnel | Si fourni, ajoute classification owned/external |
-
-> ⚠️ Pour l'analyse typique, utiliser plutôt `get_raw_responses(aggregate="classified")` qui automatise tout le flow.
-
----
-
-## 📦 Installation
+## Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 🚀 Lancement local
+## Local launch
 
 ```bash
 export MINT_API_KEY="mint_live_your_key_here"
 uvicorn mcp_mint_server:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
-Endpoints exposés :
-- `GET /health` — healthcheck JSON
-- `GET /sse` — connexion SSE (Claude.ai, clients web MCP)
-- `POST /sse` + `POST /messages` — messages JSON-RPC
+Endpoints:
+- `GET /health` — JSON healthcheck
+- `GET /sse` — SSE connection (Claude.ai, web MCP clients)
+- `POST /sse` + `POST /messages` — JSON-RPC messages
 
-## 📊 Configuration Claude Desktop
+## Claude Desktop config
 
 ```json
 {
@@ -330,7 +185,7 @@ Endpoints exposés :
     "mint-visibility": {
       "command": "python",
       "args": ["-m", "uvicorn", "mcp_mint_server:app", "--port", "8765"],
-      "cwd": "/absolute/path/to/mint-mcp-v4",
+      "cwd": "/absolute/path/to/mint-mcp",
       "env": {
         "MINT_API_KEY": "mint_live_your_key_here"
       }
@@ -339,37 +194,32 @@ Endpoints exposés :
 }
 ```
 
-## ☁️ Déploiement Render
+## Render deployment
 
-1. Push le repo sur GitHub
-2. Sur Render → New Web Service → connecter le repo
-3. Build command : `pip install -r requirements.txt`
-4. Start command : `uvicorn mcp_mint_server:app --host 0.0.0.0 --port $PORT --workers 1`
-5. Renseigner `MINT_API_KEY` dans Environment
+1. Push to GitHub
+2. Render: New Web Service, connect repo
+3. Build: `pip install -r requirements.txt`
+4. Start: `uvicorn mcp_mint_server:app --host 0.0.0.0 --port $PORT --workers 1`
+5. Set `MINT_API_KEY` in Environment
 6. Deploy
 
-Puis dans Claude.ai : connecter sur `https://<ton-app>.onrender.com/sse`.
+Connect in Claude.ai: `https://<your-app>.onrender.com/sse`
 
-## 📁 Structure du projet
+## Project structure
 
 ```
 .
-├── mcp_mint_server.py   # Serveur MCP complet (tout-en-un)
-├── owned_domains.json   # Mapping brand → domaines propriétaires
-├── requirements.txt     # Dépendances
+├── mcp_mint_server.py   # Complete MCP server (single file)
+├── owned_domains.json   # Brand → owned domains mapping
+├── requirements.txt     # Dependencies
 ├── .gitignore
 └── README.md
 ```
 
-## 🏠 Configuration "Owned Domains"
+## Owned Domains config
 
-Le fichier `owned_domains.json` mappe chaque brand à ses domaines propriétaires.
+`owned_domains.json` maps each brand to its owned domains. This provides the `ownership` axis independently of the crawl enrichment.
 
-**Pourquoi ?** L'API Mint ne crawle que les pages owned + concurrents. Pour une URL `all.accor.com` sans mention textuelle détectée par le crawl, elle est quand même **ta propriété éditoriale**. Le signal `ownership='owned'` le capture indépendamment du crawl.
-
-**Ajouter une nouvelle brand** : édite `owned_domains.json` et redémarre le serveur. Le fallback `_default` couvre les brands non listées.
-
-Exemple :
 ```json
 {
   "IBIS":     ["accor.com"],
@@ -378,47 +228,52 @@ Exemple :
 }
 ```
 
-## 🔑 Variables d'environnement
+To add a brand: edit the file and restart.
 
-| Variable | Requis | Défaut | Description |
-|----------|--------|--------|-------------|
-| `MINT_API_KEY` | ✅ | — | Clé API Mint.ai |
-| `MINT_BASE_URL` | optionnel | `https://api.getmint.ai/api` | URL de base |
-| `HTTP_TIMEOUT` | optionnel | `30.0` | Timeout HTTP (secondes) |
-| `HTTP_MAX_CONCURRENT` | optionnel | `8` | Concurrence max API |
-| `OWNED_DOMAINS_PATH` | optionnel | `./owned_domains.json` | Chemin mapping |
+## Environment variables
 
-## 📄 Changelog
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `MINT_API_KEY` | yes | — | Mint.ai API key |
+| `MINT_BASE_URL` | no | `https://api.getmint.ai/api` | Base URL |
+| `HTTP_TIMEOUT` | no | `30` | Timeout (seconds) |
+| `HTTP_MAX_CONCURRENT` | no | `8` | Max concurrent API requests |
+| `OWNED_DOMAINS_PATH` | no | `./owned_domains.json` | Mapping file path |
+
+## Backward compatibility
+
+v4.1.0 tool names are prefixed with `mint_` (e.g. `mint_get_topic_scores`). The old unprefixed names (e.g. `get_topic_scores`) still work as aliases — no breaking change for existing clients.
+
+## Changelog
+
+### v4.1.0 (2026-04-20) — Hardened & Optimized
+
+- **PERF**: Persistent `httpx.AsyncClient` with connection pooling and TLS reuse
+- **PERF**: Starlette `on_startup`/`on_shutdown` lifecycle for HTTP client management
+- **ROBUST**: Input validation on all tool arguments with clear error messages
+- **ROBUST**: Tool names prefixed with `mint_` to avoid collisions
+- **ROBUST**: Tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`)
+- **ROBUST**: New `InvalidInput` error type caught in dispatcher
+- **DOCS**: Tool descriptions rewritten in English with USE FOR / DON'T USE FOR
+- **DOCS**: README rewritten in English
+- **FIX**: Server name follows Python convention (`mint_visibility_mcp`)
+- **COMPAT**: Backward-compatible aliases for v4.0.0 unprefixed tool names
+- **COMPAT**: SSE transport preserved (Render + Claude.ai compatible)
+- **COMPAT**: Same deploy process — just push and go
 
 ### v4.0.0 (2026-04-16) — Sources Classification
 
-**Refonte majeure.** Non-rétrocompatible avec v3.x.
+Major rewrite. Not backward-compatible with v3.x.
 
-- ✅ Passage de 4 à 7 tools, plus spécialisés
-- ✅ **Classification 2 axes indépendants** (ownership + brand_status)
-- ✅ Nouveau tool `get_visibility_trend` pour graphiques temporels
-- ✅ Nouveau tool `get_raw_responses` (cœur v4) avec 3 modes
-- ✅ Nouveau tool `enrich_sources` accès direct enrichment
-- ✅ Fichier `owned_domains.json` externe pour mapping brand → domaines
-- ✅ Couplage `(reportId, url)` respecté strictement (fix bug v3.x)
-- ✅ Erreurs typées remontées au client (auth/not_found/rate_limit/api)
-- ✅ Retry exponentiel auto sur 429/5xx avec respect de `X-RateLimit-Reset`
-- ✅ Semaphore globale pour limiter la concurrence API
-- ✅ Endpoint `/health` pour healthchecks plateformes
+- 7 specialized tools (from 4)
+- 2-axis classification (ownership + brand_status)
+- `get_visibility_trend` for temporal charts
+- `get_raw_responses` with 3 modes
+- `owned_domains.json` external config
+- Strict `(reportId, url)` coupling (v3.x bug fix)
+- Typed errors, exponential retry, global semaphore
+- `/health` endpoint
 
-**Mapping v3.6 → v4 :**
-- `get_visibility_scores` → `get_topic_scores`
-- `get_visibility_monthly_summary` → `get_scores_overview`
-- `get_citations` → `get_topic_sources` + `get_raw_responses` (plus complet)
+### v3.6.0 — v3.0.0
 
-### v3.6.0 (2026-02-23)
-- ✅ Tool `get_visibility_monthly_summary` : tableau multi-topics côté serveur
-
-### v3.5.0 (2026-02-20)
-- ✅ Tool `get_citations` : top domaines & URLs
-
-### v3.4.0 (2026-02-09)
-- ✅ Historique 365 jours, limit 1000, fix 405 sur `/sse`
-
-### v3.0.0 (2026-01-15)
-- ✅ Tools `get_domains_and_topics`, `get_visibility_scores`
+See previous releases for v3.x changelog.
