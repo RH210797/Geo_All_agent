@@ -407,13 +407,32 @@ def filter_topics(
 # ══════════════════════════════════════════════════════════════════
 
 async def _tool_get_domains_and_topics(_args: dict) -> dict:
-    """Fetch all domains (brands) and their topics (markets)."""
-    domains = await fetch_get("/domains")
+    """Fetch all domains (brands) and their topics (markets).
+
+    Two-step flow:
+      1. GET /domains             -> keep ONLY id + displayName (rest is too large)
+      2. GET /domains/{id}/topics -> topicId + topicName per domain
+
+    Returns a lightweight catalog (domains, topics, mapping, errors) that can be
+    shown as a table to the user OR reused as IDs by the other tools.
+    """
+    raw_domains = await fetch_get("/domains")
+
+    # Step 1: lightweight domains (id + displayName only)
+    domains = [
+        {
+            "domainId": d.get("id"),
+            "domainName": d.get("displayName") or d.get("name") or "Unknown",
+        }
+        for d in raw_domains
+    ]
+
     topics, mapping, errors = [], {}, []
 
+    # Step 2: topics per domain
     for d in domains:
-        d_id = d.get("id")
-        d_name = d.get("displayName") or d.get("name") or "Unknown"
+        d_id = d["domainId"]
+        d_name = d["domainName"]
         try:
             d_topics = await fetch_get(f"/domains/{d_id}/topics")
         except Exception as e:
