@@ -26,7 +26,7 @@ COMPAT — SSE transport preserved (Render + Claude.ai compatible).
          No breaking change on wire protocol or deploy process.
 ═══════════════════════════════════════════════════════════════════
 
-Tools (7):
+Tools (8):
   mint_get_domains_and_topics  — catalog discovery
   mint_get_topic_scores        — Brand vs Competitors, 1 topic, per-model
   mint_get_scores_overview     — multi-topic summary table
@@ -450,6 +450,45 @@ async def _tool_get_domains_and_topics(_args: dict) -> dict:
             mapping[f"{d_name} > {t_name}"] = {"domainId": d_id, "topicId": t_id}
 
     return {"domains": domains, "topics": topics, "mapping": mapping, "errors": errors}
+
+
+# ══════════════════════════════════════════════════════════════════
+# TOOL — mint_get_models_by_topic
+# ══════════════════════════════════════════════════════════════════
+
+async def _tool_get_models_by_topic(args: dict) -> dict:
+    """List the AI models available for ONE topic.
+
+    Each topic can have its own set of models, so this is resolved live from
+    the topic's visibility endpoint rather than a hardcoded list.
+
+    Call this only when the user asks to deep-dive a specific model — by default
+    other tools return the GLOBAL (combined) view.
+    """
+    domain_id = require_str(args, "domainId")
+    topic_id = require_str(args, "topicId")
+
+    start_date, end_date = default_date_range(days=30)
+    params = {
+        "startDate": start_date, "endDate": end_date,
+        "latestOnly": "false", "page": 1, "limit": 1,
+    }
+    endpoint = f"/domains/{domain_id}/topics/{topic_id}/visibility/aggregated"
+
+    data = await fetch_get(endpoint, params)
+    available = data.get("availableModels", []) or []
+
+    return {
+        "domainId": domain_id,
+        "topicId": topic_id,
+        "models": available,
+        "count": len(available),
+        "note": (
+            "These are the models available for this topic. "
+            "Pass one (or several, comma-separated, no spaces) to the 'models' "
+            "param of mint_get_topic_scores or mint_get_topic_sources to deep-dive."
+        ),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1204,6 +1243,36 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
     ),
 
     (
+        "mint_get_models_by_topic",
+        (
+            "MODELS AVAILABLE FOR 1 TOPIC — returns the list of AI models that exist "
+            "for a given topic. Each topic can have its own models, so resolve them live."
+            "\n\n"
+            "USE FOR: after the user answers YES to a deep-dive offer, to know which "
+            "model names are valid for the 'models' param of other tools."
+            "\n\n"
+            "BEHAVIOR RULE FOR THE ASSISTANT:\n"
+            "  By DEFAULT, when the user asks for numbers or analysis, return the GLOBAL "
+            "(combined) data WITHOUT calling this tool. Then, at the end of EVERY such "
+            "answer, add one short sentence offering a per-model deep dive, e.g. "
+            "'Want a deep dive on a specific model?'. "
+            "ONLY if the user says yes, call this tool to list the available models for "
+            "that topic, then use them with mint_get_topic_scores / mint_get_topic_sources."
+            "\n\n"
+            "Returns: domainId, topicId, models (list), count, note."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "domainId": {"type": "string", "description": "Domain ID (REQUIRED). Get from mint_get_domains_and_topics."},
+                "topicId":  {"type": "string", "description": "Topic ID (REQUIRED). Get from mint_get_domains_and_topics."},
+            },
+            "required": ["domainId", "topicId"],
+        },
+        {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+    ),
+
+    (
         "mint_get_topic_scores",
         (
             "DETAILED SCORES FOR 1 TOPIC — day-by-day Brand vs Competitors history, "
@@ -1451,6 +1520,7 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
 _TOOL_HANDLERS: dict[str, Any] = {
     # v4.1.0 prefixed names
     "mint_get_domains_and_topics": _tool_get_domains_and_topics,
+    "mint_get_models_by_topic":    _tool_get_models_by_topic,
     "mint_get_topic_scores":       _tool_get_topic_scores,
     "mint_get_scores_overview":    _tool_get_scores_overview,
     "mint_get_visibility_trend":   _tool_get_visibility_trend,
@@ -1459,6 +1529,7 @@ _TOOL_HANDLERS: dict[str, Any] = {
     "mint_enrich_sources":         _tool_enrich_sources,
     # v4.0.0 backward-compat aliases (same handlers)
     "get_domains_and_topics": _tool_get_domains_and_topics,
+    "get_models_by_topic":    _tool_get_models_by_topic,
     "get_topic_scores":       _tool_get_topic_scores,
     "get_scores_overview":    _tool_get_scores_overview,
     "get_visibility_trend":   _tool_get_visibility_trend,
@@ -1470,7 +1541,7 @@ _TOOL_HANDLERS: dict[str, Any] = {
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    """Declare all 7 tools with descriptions, schemas, and annotations."""
+    """Declare all 8 tools with descriptions, schemas, and annotations."""
     return [
         Tool(
             name=name,

@@ -2,17 +2,19 @@
 
 MCP server for analyzing brand visibility in LLM responses via the Mint.ai API.
 
-**Version 4.1.0** — Hardened & Optimized: persistent HTTP client, input validation, prefixed tool names, tool annotations, English docs.
+**Version 4.2.0** — Lightweight catalog + per-topic model discovery: `mint_get_domains_and_topics` now returns slim domains (id + displayName only), new `mint_get_models_by_topic` tool, GLOBAL-by-default with deep-dive offer.
 
 ---
 
-## Tools (7)
+## Tools (8)
 
 ---
 
 ### 1. `mint_get_domains_and_topics`
 
 Lists all domains (brands) and topics (markets). **Call first** to get IDs needed by other tools.
+
+Two-step internally: `GET /domains` (kept slim — only `id` + `displayName`, the rest of the domain payload is too large) then `GET /domains/{id}/topics` per domain.
 
 | Annotation | Value |
 |---|---|
@@ -24,7 +26,7 @@ Lists all domains (brands) and topics (markets). **Call first** to get IDs neede
 **Returns:**
 ```json
 {
-  "domains": [...],
+  "domains": [{"domainId": "694a...", "domainName": "IBIS"}],
   "topics": [{"domainId": "...", "domainName": "IBIS", "topicId": "...", "topicName": "IBIS FR"}],
   "mapping": {"IBIS > IBIS FR": {"domainId": "694a...", "topicId": "694a..."}},
   "errors": []
@@ -33,7 +35,36 @@ Lists all domains (brands) and topics (markets). **Call first** to get IDs neede
 
 ---
 
-### 2. `mint_get_topic_scores`
+### 2. `mint_get_models_by_topic`
+
+Lists the AI models available for **one topic**. Each topic can have its own set of models, so they are resolved live from the topic's visibility endpoint (not hardcoded).
+
+| Param | Required | Description |
+|---|---|---|
+| `domainId` | yes | Domain ID |
+| `topicId` | yes | Topic ID |
+
+| Annotation | Value |
+|---|---|
+| readOnlyHint | true |
+| idempotentHint | true |
+
+**Behavior:** By default, score/analysis tools return the GLOBAL (combined) view. The assistant should close each such answer by offering a per-model deep dive (e.g. "Want a deep dive on a specific model?"). Only when the user accepts, call this tool to list the topic's models, then pass them to the `models` param of `mint_get_topic_scores` / `mint_get_topic_sources`.
+
+**Returns:**
+```json
+{
+  "domainId": "694a...",
+  "topicId": "694a...",
+  "models": ["gpt-5.1", "sonar-pro", "gemini-3-pro-preview", "..."],
+  "count": 6,
+  "note": "..."
+}
+```
+
+---
+
+### 3. `mint_get_topic_scores`
 
 Day-by-day Brand vs Competitors scores for **one topic**, broken down by AI model.
 
@@ -49,7 +80,7 @@ Day-by-day Brand vs Competitors scores for **one topic**, broken down by AI mode
 
 ---
 
-### 3. `mint_get_scores_overview`
+### 4. `mint_get_scores_overview`
 
 Average visibility score for **multiple topics** in one call. Self-contained: fetches topics via filters.
 
@@ -65,7 +96,7 @@ Average visibility score for **multiple topics** in one call. Self-contained: fe
 
 ---
 
-### 4. `mint_get_visibility_trend`
+### 5. `mint_get_visibility_trend`
 
 **Binned time series** (day/week/month) for line charts.
 
@@ -87,7 +118,7 @@ Average visibility score for **multiple topics** in one call. Self-contained: fe
 
 ---
 
-### 5. `mint_get_topic_sources`
+### 6. `mint_get_topic_sources`
 
 Top cited domains and URLs for **one topic**, per AI model. Uses Mint's pre-aggregated API (fast).
 
@@ -102,7 +133,7 @@ Top cited domains and URLs for **one topic**, per AI model. Uses Mint's pre-aggr
 
 ---
 
-### 6. `mint_get_raw_responses` (core)
+### 7. `mint_get_raw_responses` (core)
 
 Classifies every cited URL on **2 independent axes**:
 
@@ -143,7 +174,7 @@ Classifies every cited URL on **2 independent axes**:
 
 ---
 
-### 7. `mint_enrich_sources`
+### 8. `mint_enrich_sources`
 
 Direct batch URL enrichment: DataForSEO category + detected brands.
 
@@ -242,9 +273,17 @@ To add a brand: edit the file and restart.
 
 ## Backward compatibility
 
-v4.1.0 tool names are prefixed with `mint_` (e.g. `mint_get_topic_scores`). The old unprefixed names (e.g. `get_topic_scores`) still work as aliases — no breaking change for existing clients.
+Tool names are prefixed with `mint_` (e.g. `mint_get_topic_scores`). The old unprefixed names (e.g. `get_topic_scores`, `get_models_by_topic`) still work as aliases — no breaking change for existing clients.
 
 ## Changelog
+
+### v4.2.0 (2026-06-01) — Slim catalog + per-topic models
+
+- **NEW**: `mint_get_models_by_topic` — lists the AI models available for a topic, resolved live (each topic can have its own models)
+- **CHANGE**: `mint_get_domains_and_topics` now returns slim domains (`domainId` + `domainName` only) instead of the full domain payload — same output structure, much smaller response
+- **BEHAVIOR**: score/analysis tools return GLOBAL by default; the assistant offers a per-model deep dive and only fetches models on user request
+- **DOCS**: README updated, tool count 7 → 8
+- **COMPAT**: backward-compatible alias `get_models_by_topic`; same deploy process
 
 ### v4.1.0 (2026-04-20) — Hardened & Optimized
 
