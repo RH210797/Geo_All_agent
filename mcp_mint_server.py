@@ -26,7 +26,7 @@ COMPAT — SSE transport preserved (Render + Claude.ai compatible).
          No breaking change on wire protocol or deploy process.
 ═══════════════════════════════════════════════════════════════════
 
-Tools (8):
+Tools (7 exposed):
   mint_get_domains_and_topics  — catalog discovery
   mint_get_topic_scores        — Brand vs Competitors, 1 topic, per-model
   mint_get_scores_overview     — multi-topic summary table
@@ -1229,14 +1229,25 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
     (
         "mint_get_domains_and_topics",
         (
-            "CATALOG DISCOVERY — lists all available domains (brands) and topics (markets). "
-            "Call this FIRST to get the IDs required by other tools, or to show the user "
-            "which brands/markets they can analyze."
+            "STEP 1 — ALWAYS START HERE. Lists every domain (brand) and topic (market) you "
+            "have access to, with their IDs. Every other tool needs a domainId and/or topicId, "
+            "and those IDs come from THIS tool. If you don't already have the exact IDs in the "
+            "conversation, call this first."
             "\n\n"
-            "USE FOR: 'What brands do I have?', 'List my topics', 'Show all IBIS markets', "
-            "or to look up a domainId/topicId before calling another tool."
+            "USE FOR: 'What brands/markets do I have?', 'List my topics', 'Show all IBIS markets', "
+            "or silently to resolve a brand/market name into IDs before another tool."
             "\n\n"
-            "Returns: domains, topics, mapping 'Brand > Topic' to IDs, errors."
+            "ROUTING MAP (which source/score tool to use next):\n"
+            "  - One brand's score history over time      -> mint_get_topic_scores\n"
+            "  - Compare many markets/brands in a table    -> mint_get_scores_overview\n"
+            "  - A line chart of visibility over time      -> mint_get_visibility_trend\n"
+            "  - Which sites/URLs are cited (by model/time)-> mint_get_topic_sources\n"
+            "  - WHO mentions my brand vs competitors,\n"
+            "    owned vs external, fine classification    -> mint_get_raw_responses\n"
+            "  - Which AI models exist for a topic         -> mint_get_models_by_topic"
+            "\n\n"
+            "Returns: domains (id+name), topics (domainId, domainName, topicId, topicName), "
+            "a 'Brand > Topic' -> IDs mapping, and any errors."
         ),
         {"type": "object", "properties": {}},
         {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
@@ -1245,27 +1256,28 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
     (
         "mint_get_models_by_topic",
         (
-            "MODELS AVAILABLE FOR 1 TOPIC — returns the list of AI models that exist "
-            "for a given topic. Each topic can have its own models, so resolve them live."
+            "LIST AI MODELS FOR ONE TOPIC. Returns the exact model names available for a "
+            "given topic (each topic can have a different set), resolved live from the API. "
+            "These names are what you pass to the 'models' parameter of mint_get_topic_scores, "
+            "mint_get_topic_sources, mint_get_scores_overview, mint_get_visibility_trend or "
+            "mint_get_raw_responses."
             "\n\n"
-            "USE FOR: after the user answers YES to a deep-dive offer, to know which "
-            "model names are valid for the 'models' param of other tools."
+            "USE FOR: 'Which models are tracked for IBIS FR?', or right after the user accepts "
+            "a per-model deep dive, to get valid model names before filtering."
             "\n\n"
-            "BEHAVIOR RULE FOR THE ASSISTANT:\n"
-            "  By DEFAULT, when the user asks for numbers or analysis, return the GLOBAL "
-            "(combined) data WITHOUT calling this tool. Then, at the end of EVERY such "
-            "answer, add one short sentence offering a per-model deep dive, e.g. "
-            "'Want a deep dive on a specific model?'. "
-            "ONLY if the user says yes, call this tool to list the available models for "
-            "that topic, then use them with mint_get_topic_scores / mint_get_topic_sources."
+            "ASSISTANT BEHAVIOR RULE:\n"
+            "  By default, answer score/source questions with the GLOBAL (all-models combined) "
+            "view and do NOT call this tool. At the end of such an answer, offer one short "
+            "follow-up like 'Want a deep dive on a specific model?'. ONLY if the user says yes, "
+            "call this tool, then re-run the relevant tool with the chosen 'models' value."
             "\n\n"
             "Returns: domainId, topicId, models (list), count, note."
         ),
         {
             "type": "object",
             "properties": {
-                "domainId": {"type": "string", "description": "Domain ID (REQUIRED). Get from mint_get_domains_and_topics."},
-                "topicId":  {"type": "string", "description": "Topic ID (REQUIRED). Get from mint_get_domains_and_topics."},
+                "domainId": {"type": "string", "description": "Domain ID (REQUIRED). From mint_get_domains_and_topics."},
+                "topicId":  {"type": "string", "description": "Topic ID (REQUIRED). From mint_get_domains_and_topics."},
             },
             "required": ["domainId", "topicId"],
         },
@@ -1275,31 +1287,31 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
     (
         "mint_get_topic_scores",
         (
-            "DETAILED SCORES FOR 1 TOPIC — day-by-day Brand vs Competitors history, "
-            "broken down by AI model. Makes 1 GLOBAL call + 1 call per model in parallel."
+            "SCORE HISTORY FOR ONE TOPIC — day-by-day visibility scores of your brand vs its "
+            "competitors, for a single topic (one brand in one market), broken down by AI model. "
+            "This is the detailed single-topic view: each day, each entity, each model."
             "\n\n"
-            "USE FOR: 'IBIS FR score evolution vs competitors', "
-            "'Compare GPT-5.1 vs Sonar Pro on Novotel UK', detailed single-topic deep dive."
+            "USE FOR: 'How did IBIS FR score vs competitors last month?', "
+            "'Show the daily score curve for Novotel UK', "
+            "'Compare GPT-5.1 vs Sonar Pro scores on one topic'."
             "\n\n"
-            "DON'T USE FOR:\n"
-            "  Multi-topic summary -> mint_get_scores_overview\n"
-            "  Time series chart -> mint_get_visibility_trend\n"
-            "  Source analysis -> mint_get_topic_sources or mint_get_raw_responses"
+            "DON'T USE FOR (pick the right tool instead):\n"
+            "  - Several topics/markets at once, as a table -> mint_get_scores_overview\n"
+            "  - A ready-to-plot time-series line chart     -> mint_get_visibility_trend\n"
+            "  - Anything about CITED SOURCES/URLs          -> mint_get_topic_sources or mint_get_raw_responses"
             "\n\n"
-            "Available models: GLOBAL, gpt-5.1, sonar-pro, google-ai-overview, "
-            "gemini-3-pro-preview, gpt-5, gpt-interface."
-            "\n\n"
-            "GOLDEN RULE: if the user does NOT mention dates or models, OMIT those params. "
-            "Defaults: last 30 days, all models."
+            "GOLDEN RULE: if the user does NOT mention specific dates or a model, OMIT those "
+            "params (defaults: last 30 days, all models). Only pass 'models' once the user asks "
+            "for a specific model (get valid names from mint_get_models_by_topic)."
         ),
         {
             "type": "object",
             "properties": {
-                "domainId":  {"type": "string", "description": "Domain ID (REQUIRED). Get from mint_get_domains_and_topics."},
-                "topicId":   {"type": "string", "description": "Topic ID (REQUIRED). Get from mint_get_domains_and_topics."},
-                "startDate": {"type": "string", "description": "Start date YYYY-MM-DD (optional, default: 30 days ago)."},
-                "endDate":   {"type": "string", "description": "End date YYYY-MM-DD (optional, default: today)."},
-                "models":    {"type": "string", "description": "Comma-separated model filter, NO spaces. E.g. 'gpt-5.1,sonar-pro'. Omit for all models."},
+                "domainId":  {"type": "string", "description": "Domain ID (REQUIRED). From mint_get_domains_and_topics."},
+                "topicId":   {"type": "string", "description": "Topic ID (REQUIRED). From mint_get_domains_and_topics."},
+                "startDate": {"type": "string", "description": "Start date YYYY-MM-DD. Optional (default: 30 days ago). Omit unless the user gave a date."},
+                "endDate":   {"type": "string", "description": "End date YYYY-MM-DD. Optional (default: today). Omit unless the user gave a date."},
+                "models":    {"type": "string", "description": "Comma-separated model filter, NO spaces (e.g. 'gpt-5.1,sonar-pro'). Omit for all models."},
             },
             "required": ["domainId", "topicId"],
         },
@@ -1309,32 +1321,32 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
     (
         "mint_get_scores_overview",
         (
-            "MULTI-TOPIC SUMMARY TABLE — average visibility score per topic over a period, "
-            "returned as a compact Markdown table. Self-contained: fetches topics automatically "
-            "via brand_filter / market_filter."
+            "MULTI-TOPIC SUMMARY TABLE — one average visibility score per topic over a period, "
+            "returned as a compact Markdown table + JSON rows. This is the cross-market / "
+            "cross-brand comparison view. It resolves topics itself from brand_filter / "
+            "market_filter, so you don't pass topic IDs one by one."
             "\n\n"
-            "USE FOR: 'Compare all IBIS markets in January', 'Q1 2026 overview all brands', "
-            "'Which market performs best?'."
+            "USE FOR: 'Compare all IBIS markets', 'Q1 overview across brands', "
+            "'Which market performs best?', 'Average score per market this quarter'."
             "\n\n"
-            "DON'T USE FOR:\n"
-            "  Day-by-day history -> mint_get_topic_scores\n"
-            "  Time series chart -> mint_get_visibility_trend\n"
-            "  Source analysis -> mint_get_raw_responses"
+            "DON'T USE FOR (pick the right tool instead):\n"
+            "  - Day-by-day history of ONE topic        -> mint_get_topic_scores\n"
+            "  - A line chart over time                 -> mint_get_visibility_trend\n"
+            "  - Cited sources/URLs                      -> mint_get_topic_sources or mint_get_raw_responses"
             "\n\n"
-            "TIP: brand_filter ('IBIS') and market_filter ('FR') reduce API calls. "
-            "Combine both for precise targeting."
-            "\n\n"
-            "GOLDEN RULE: omit startDate/endDate/models when not specified by user. "
-            "Defaults: last 90 days, all models."
+            "TIP: brand_filter ('IBIS') and market_filter ('FR') narrow the scope and reduce API "
+            "calls; combine both to target precisely. "
+            "GOLDEN RULE: omit startDate/endDate/models unless the user specified them "
+            "(defaults: last 90 days, all models combined)."
         ),
         {
             "type": "object",
             "properties": {
                 "brand_filter":  {"type": "string", "description": "Filter by brand name (e.g. 'IBIS', 'Mercure', 'Fairmont'). Optional."},
-                "market_filter": {"type": "string", "description": "Filter by market keyword in topic name (e.g. 'FR', 'UK', 'DE'). Optional."},
-                "topic_ids":     {"type": "array", "items": {"type": "string"}, "description": "Explicit list of topicIds. Optional."},
-                "startDate":     {"type": "string", "description": "Start date YYYY-MM-DD (default: 90 days ago)."},
-                "endDate":       {"type": "string", "description": "End date YYYY-MM-DD (default: today)."},
+                "market_filter": {"type": "string", "description": "Filter by market keyword in the topic name (e.g. 'FR', 'UK', 'DE'). Optional."},
+                "topic_ids":     {"type": "array", "items": {"type": "string"}, "description": "Explicit list of topicIds. Optional (overrides filters)."},
+                "startDate":     {"type": "string", "description": "Start date YYYY-MM-DD. Optional (default: 90 days ago)."},
+                "endDate":       {"type": "string", "description": "End date YYYY-MM-DD. Optional (default: today)."},
                 "models":        {"type": "string", "description": "Comma-separated model filter. Omit for cross-model average."},
             },
             "required": [],
@@ -1345,24 +1357,22 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
     (
         "mint_get_visibility_trend",
         (
-            "BINNED TIME SERIES — visibility scores aggregated by day/week/month, "
-            "ready for line charts. Returns {series: [{name, points: [{date, score, n}]}]}."
+            "TIME-SERIES FOR CHARTING — visibility scores binned by day/week/month, shaped for "
+            "line charts: {series: [{name, points: [{date, score, n}]}]}. Use this specifically "
+            "when the user wants to SEE a trend/curve over time. After receiving the data, render "
+            "a line chart in a Claude artifact (e.g. Recharts)."
             "\n\n"
-            "When you receive this data, GENERATE a line chart in a Claude artifact (Recharts, etc.)."
+            "USE FOR: 'Weekly IBIS visibility curve since January', 'Monthly trend chart for Q1', "
+            "'Plot IBIS FR vs UK over 6 months' (use aggregation='per_topic')."
             "\n\n"
-            "USE FOR: 'Weekly IBIS visibility curve since January', "
-            "'Monthly trend chart for Q1', "
-            "'Compare IBIS FR vs UK over 6 months' (aggregation='per_topic')."
+            "DON'T USE FOR (pick the right tool instead):\n"
+            "  - Just numbers, no chart, one topic   -> mint_get_topic_scores\n"
+            "  - A comparison table across topics     -> mint_get_scores_overview\n"
+            "  - Sources/URLs                          -> mint_get_topic_sources or mint_get_raw_responses"
             "\n\n"
-            "DON'T USE if the user just wants numbers without a chart "
-            "-> mint_get_scores_overview or mint_get_topic_scores."
-            "\n\n"
-            "KEY PARAMS:\n"
-            "  granularity='week' (default): 1 point per Monday\n"
-            "  aggregation='average' (default): single averaged series\n"
-            "  aggregation='per_topic': one series per topic for visual comparison\n"
-            "\n"
-            "Default period: Jan 1st of current year to today."
+            "KEY PARAMS: granularity='week' (default; 'day'/'month' available); "
+            "aggregation='average' (single averaged series) or 'per_topic' (one series per topic "
+            "for visual comparison). Default period: Jan 1st of current year to today."
         ),
         {
             "type": "object",
@@ -1370,11 +1380,11 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
                 "brand_filter":  {"type": "string", "description": "Filter by brand name. Optional."},
                 "market_filter": {"type": "string", "description": "Filter by market keyword. Optional."},
                 "topic_ids":     {"type": "array", "items": {"type": "string"}, "description": "Explicit topicId list. Optional."},
-                "startDate":     {"type": "string", "description": "YYYY-MM-DD (default: Jan 1st current year)."},
-                "endDate":       {"type": "string", "description": "YYYY-MM-DD (default: today)."},
+                "startDate":     {"type": "string", "description": "YYYY-MM-DD. Optional (default: Jan 1st current year)."},
+                "endDate":       {"type": "string", "description": "YYYY-MM-DD. Optional (default: today)."},
                 "models":        {"type": "string", "description": "Comma-separated model filter. Optional."},
                 "granularity":   {"type": "string", "enum": ["day", "week", "month"], "description": "Time bin size. Default: 'week'."},
-                "aggregation":   {"type": "string", "enum": ["average", "per_topic"], "description": "'average' = single series, 'per_topic' = one per topic. Default: 'average'."},
+                "aggregation":   {"type": "string", "enum": ["average", "per_topic"], "description": "'average' = single series; 'per_topic' = one series per topic. Default: 'average'."},
             },
             "required": [],
         },
@@ -1384,28 +1394,30 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
     (
         "mint_get_topic_sources",
         (
-            "TOP CITED DOMAINS & URLs — for 1 topic, per AI model. "
-            "Uses Mint's pre-aggregated API (fast). "
-            "1 GLOBAL call + 1 call per model in parallel."
+            "WHICH SITES & URLs ARE CITED (fast, by model, over time) — for ONE topic, returns "
+            "the most-cited domains and URLs, broken down by AI model, plus how citations evolve "
+            "over time. Uses Mint's pre-aggregated API, so it's fast. "
+            "It answers 'WHO is cited and HOW OFTEN', NOT 'does the page mention my brand'."
             "\n\n"
             "USE FOR: 'Which websites are most cited for IBIS FR?', "
-            "'Compare sources between GPT-5.1 and Sonar Pro on Novotel UK', "
-            "'Citation evolution over time for this topic'."
+            "'Top cited URLs on this topic', 'Compare cited sources between GPT-5.1 and Sonar Pro', "
+            "'How did citations evolve over time for this topic?'."
             "\n\n"
-            "DON'T USE FOR:\n"
-            "  Classify sources (who mentions my brand vs competitors) -> mint_get_raw_responses\n"
-            "  Category / brand detection enrichment -> mint_get_raw_responses or mint_enrich_sources"
+            "DON'T USE FOR — use mint_get_raw_responses instead — any question about WHAT THE PAGE "
+            "SAYS: whether a page mentions YOUR brand, only competitors, or both; owned vs external "
+            "classification; 'who replaces me when I'm not cited'. This tool cannot tell you that "
+            "(no page-content enrichment)."
             "\n\n"
             "Returns: top_domains, top_urls, domains_over_time, urls_over_time, global_metrics."
         ),
         {
             "type": "object",
             "properties": {
-                "domainId":  {"type": "string", "description": "Domain ID (REQUIRED)."},
-                "topicId":   {"type": "string", "description": "Topic ID (REQUIRED)."},
-                "startDate": {"type": "string", "description": "YYYY-MM-DD (default: 90 days ago)."},
-                "endDate":   {"type": "string", "description": "YYYY-MM-DD (default: today)."},
-                "models":    {"type": "string", "description": "Comma-separated model filter. Optional."},
+                "domainId":  {"type": "string", "description": "Domain ID (REQUIRED). From mint_get_domains_and_topics."},
+                "topicId":   {"type": "string", "description": "Topic ID (REQUIRED). From mint_get_domains_and_topics."},
+                "startDate": {"type": "string", "description": "YYYY-MM-DD. Optional (default: 90 days ago)."},
+                "endDate":   {"type": "string", "description": "YYYY-MM-DD. Optional (default: today)."},
+                "models":    {"type": "string", "description": "Comma-separated model filter, NO spaces. Optional (omit for all models)."},
             },
             "required": ["domainId", "topicId"],
         },
@@ -1415,64 +1427,71 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
     (
         "mint_get_raw_responses",
         (
-            "CORE SOURCE ANALYSIS — classifies every cited URL on 2 INDEPENDENT axes:"
+            "DEEP SOURCE ANALYSIS — the powerful tool for 'who mentions my brand vs competitors' "
+            "and 'are my citations from my own site or third parties'. It classifies every cited "
+            "URL on 2 INDEPENDENT axes, with page-content enrichment (category + detected brands) "
+            "BUILT IN — you do not need any separate enrichment step."
             "\n\n"
-            "AXIS 1 — ownership (domain regex, independent of crawl):\n"
-            "  'owned' = URL on a brand-owned domain (e.g. all.accor.com for IBIS)\n"
-            "  'external' = URL on a third-party domain (booking.com, tripadvisor.com...)"
+            "AXIS 1 — ownership (from the domain itself):\n"
+            "  'owned'    = URL on a brand-owned domain (e.g. all.accor.com for IBIS)\n"
+            "  'external' = third-party domain (booking.com, tripadvisor.com, reddit.com...)"
             "\n\n"
-            "AXIS 2 — brand_status (via /sources/enrichment crawl):\n"
-            "  'own_only' = page mentions your brand only\n"
-            "  'own+comp' = page mentions your brand AND competitors\n"
-            "  'comp_only' = page mentions only competitors\n"
-            "  'no_brand' = crawl ran but detected no brand\n"
+            "AXIS 2 — brand_status (from crawling the page content):\n"
+            "  'own_only'     = page mentions YOUR brand only\n"
+            "  'own+comp'     = page mentions your brand AND competitors\n"
+            "  'comp_only'    = page mentions competitors only\n"
+            "  'no_brand'     = crawled, but no brand detected\n"
             "  'not_enriched' = no crawl data available"
             "\n\n"
-            "TYPICAL USE CASES:\n"
-            "  1) 'Sources that also cite competitors when IBIS is mentioned'\n"
-            "     -> response_brand_mentioned='true', brand_status_filter=['comp_only','own+comp']\n"
-            "  2) 'External sources mentioning my brand'\n"
+            "USE FOR (with the params to set):\n"
+            "  1) 'External sites that mention my brand'\n"
             "     -> ownership_filter='external', brand_status_filter=['own_only','own+comp']\n"
-            "  3) 'Sources citing only competitors'\n"
+            "  2) 'Sites citing only my competitors'\n"
             "     -> brand_status_filter='comp_only'\n"
-            "  4) 'My owned URLs appearing in LLM responses'\n"
+            "  3) 'My own URLs surfacing in answers'\n"
             "     -> ownership_filter='owned'\n"
-            "  5) 'When IBIS is NOT cited, who takes my place?'\n"
-            "     -> response_brand_mentioned='false', aggregate='sources'"
+            "  4) 'When my brand is NOT cited, who takes my place?'\n"
+            "     -> response_brand_mentioned='false', aggregate='sources'\n"
+            "  5) 'Pages mentioning me that also cite rivals'\n"
+            "     -> response_brand_mentioned='true', brand_status_filter=['own+comp']"
             "\n\n"
-            "3 MODES via aggregate:\n"
-            "  'classified' (default) = full 2-axis classification + cross matrix\n"
-            "  'sources' = top domains/URLs without enrichment (faster)\n"
-            "  'none' = raw responses for drill-down"
+            "DON'T USE FOR: a simple 'top cited sites' or 'citations over time' question with no "
+            "brand-mention angle -> mint_get_topic_sources is faster."
             "\n\n"
-            "Strictly respects (reportId, url) coupling required by Mint API."
+            "3 OUTPUT MODES (param 'aggregate'):\n"
+            "  'classified' (default) = full 2-axis classification per URL + a cross matrix (the rich view)\n"
+            "  'sources'              = ranked domains/URLs only, no enrichment (faster)\n"
+            "  'none'                 = raw responses for manual drill-down"
+            "\n\n"
+            "GOLDEN RULE: omit startDate/endDate/models unless the user specified them. "
+            "Start with aggregate='classified' for any 'who mentions whom' question."
         ),
         {
             "type": "object",
             "properties": {
-                "domainId":       {"type": "string", "description": "Domain ID (REQUIRED)."},
-                "topic_ids":      {"type": "array", "items": {"type": "string"}, "description": "TopicId list. Optional (defaults to all topics for this domain)."},
-                "brand_filter":   {"type": "string", "description": "Filter by brand name. Optional."},
-                "market_filter":  {"type": "string", "description": "Filter by market keyword. Optional."},
+                "domainId":       {"type": "string", "description": "Domain ID (REQUIRED). From mint_get_domains_and_topics."},
+                "topic_ids":      {"type": "array", "items": {"type": "string"}, "description": "TopicId list. Optional (defaults to ALL topics of this domain)."},
+                "brand_filter":   {"type": "string", "description": "Filter topics by brand name. Optional."},
+                "market_filter":  {"type": "string", "description": "Filter topics by market keyword (e.g. 'FR'). Optional."},
                 "startDate":      {"type": "string", "description": "YYYY-MM-DD. Optional."},
                 "endDate":        {"type": "string", "description": "YYYY-MM-DD. Optional."},
-                "models":         {"type": "string", "description": "Comma-separated model filter. Optional."},
-                "latestOnly":     {"type": "boolean", "description": "If true, only use the most recent report (ignores dates). Default: false."},
+                "models":         {"type": "string", "description": "Comma-separated model filter, NO spaces. Optional."},
+                "latestOnly":     {"type": "boolean", "description": "If true, use only the most recent report and ignore dates. Default: false."},
                 "response_brand_mentioned": {
                     "type": "string", "enum": ["true", "false", "all"],
-                    "description": "RESPONSE-level filter: is the brand mentioned in the LLM response? Default: 'all'.",
+                    "description": "RESPONSE-level filter: was your brand mentioned in the LLM answer? 'false' is the key to 'who replaces me'. Default: 'all'.",
                 },
                 "aggregate": {
                     "type": "string", "enum": ["classified", "sources", "none"],
-                    "description": "Output mode. Default: 'classified'.",
+                    "description": "Output mode. Default: 'classified' (full 2-axis analysis).",
                 },
                 "ownership_filter": {
                     "type": "string", "enum": ["owned", "external", "all"],
-                    "description": "Axis 1 filter. Default: 'all'.",
+                    "description": "Axis-1 filter: keep owned, external, or all URLs. Default: 'all'.",
                 },
                 "brand_status_filter": {
                     "oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}],
-                    "description": "Axis 2 filter: one value or list from: own_only, own+comp, comp_only, no_brand, not_enriched. Default: all.",
+                    "description": "Axis-2 filter: one value or a list from own_only, own+comp, comp_only, no_brand, not_enriched. Default: all.",
                 },
                 "top_n": {"type": "integer", "description": "Max URLs returned. Default: 30, max: 500."},
             },
@@ -1481,35 +1500,12 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
         {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
     ),
 
-    (
-        "mint_enrich_sources",
-        (
-            "BATCH URL ENRICHMENT — for a list of URLs + a reportId, returns "
-            "DataForSEO category + detected brands (isBrand=true = own, false = competitor). "
-            "Auto-chunks at 100 URLs (API limit)."
-            "\n\n"
-            "USE FOR: debugging specific URLs, custom workflows outside the raw_responses flow, "
-            "manually enriching a known batch of URLs."
-            "\n\n"
-            "WARNING: For typical analysis (who cites my brand / competitors), prefer "
-            "mint_get_raw_responses(aggregate='classified') which automates the full pipeline."
-            "\n\n"
-            "Returns: enriched (URL to {sourceCategory, detectedBrands}), omitted, stats, "
-            "ownership (if brand_name provided)."
-        ),
-        {
-            "type": "object",
-            "properties": {
-                "domainId":   {"type": "string", "description": "Domain ID (REQUIRED)."},
-                "urls":       {"type": "array", "items": {"type": "string"}, "description": "URLs to enrich (REQUIRED, max 1000)."},
-                "reportId":   {"type": "string", "description": "Report ID (REQUIRED — API indexes by (reportId, url))."},
-                "topicId":    {"type": "string", "description": "Topic ID to resolve market/language. Optional."},
-                "brand_name": {"type": "string", "description": "If provided, adds owned/external classification."},
-            },
-            "required": ["domainId", "urls", "reportId"],
-        },
-        {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
-    ),
+    # ── mint_enrich_sources is intentionally NOT exposed as a tool. ──
+    # Its enrichment logic (category + brand detection) is already built into
+    # mint_get_raw_responses(aggregate='classified'), which is what should be used
+    # for any fine-grained source analysis. The handler _tool_enrich_sources and the
+    # internal helper _enrich_report_batch remain available in code. To re-expose it
+    # as a standalone tool, restore its (name, description, schema, annotations) tuple here.
 ]
 
 
@@ -1541,7 +1537,7 @@ _TOOL_HANDLERS: dict[str, Any] = {
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    """Declare all 8 tools with descriptions, schemas, and annotations."""
+    """Declare the 7 exposed tools with descriptions, schemas, and annotations."""
     return [
         Tool(
             name=name,
