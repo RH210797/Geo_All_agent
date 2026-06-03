@@ -76,6 +76,9 @@ MINT_API_KEY: str = os.getenv("MINT_API_KEY", "")
 MINT_BASE_URL: str = os.getenv("MINT_BASE_URL", "https://api.getmint.ai/api")
 HTTP_TIMEOUT: float = float(os.getenv("HTTP_TIMEOUT", "30.0"))
 HTTP_MAX_CONCURRENT: int = int(os.getenv("HTTP_MAX_CONCURRENT", "8"))
+# Hard ceiling for a single tool call. Kept below typical MCP client timeouts
+# so the server returns a clean error BEFORE the client gives up / drops the connection.
+TOOL_TIMEOUT: float = float(os.getenv("TOOL_TIMEOUT", "120.0"))
 
 _OWNED_DEFAULT_PATH = Path(__file__).resolve().parent / "owned_domains.json"
 OWNED_DOMAINS_PATH: str = os.getenv("OWNED_DOMAINS_PATH", str(_OWNED_DEFAULT_PATH))
@@ -106,14 +109,25 @@ _http_client: httpx.AsyncClient | None = None
 async def _start_http_client() -> None:
     """Create persistent HTTP client on server startup."""
     global _http_client
+    # Granular timeouts so a single stalled request fails fast instead of
+    # blocking the whole tool for HTTP_TIMEOUT seconds:
+    #   connect: short — if we can't reach the API quickly, fail and retry
+    #   read:    full HTTP_TIMEOUT — the API can be slow to compute a response
+    #   write/pool: bounded
+    timeout = httpx.Timeout(
+        connect=10.0,
+        read=HTTP_TIMEOUT,
+        write=15.0,
+        pool=15.0,
+    )
     _http_client = httpx.AsyncClient(
-        timeout=HTTP_TIMEOUT,
+        timeout=timeout,
         limits=httpx.Limits(
             max_connections=HTTP_MAX_CONCURRENT + 2,
             max_keepalive_connections=HTTP_MAX_CONCURRENT,
         ),
     )
-    logger.info("HTTP client started (timeout=%.0fs, pool=%d)", HTTP_TIMEOUT, HTTP_MAX_CONCURRENT)
+    logger.info("HTTP client started (read_timeout=%.0fs, pool=%d)", HTTP_TIMEOUT, HTTP_MAX_CONCURRENT)
 
 
 async def _stop_http_client() -> None:
@@ -1562,7 +1576,20 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         )]
 
     try:
-        result = await fn(arguments or {})
+        result = await asyncio.wait_for(fn(arguments or {}), timeout=TOOL_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.warning("Tool %s timed out after %.0fs", name, TOOL_TIMEOUT)
+        result = {
+            "status": "error",
+            "error_type": "timeout",
+            "message": (
+                f"This request took longer than {TOOL_TIMEOUT:.0f}s and was stopped before "
+                "completing. The scope is likely too large. Try one of: narrow the date range "
+                "(startDate/endDate), analyze fewer topics at once (use topic_ids or "
+                "brand_filter/market_filter), filter to a single model (models=...), or for "
+                "mint_get_raw_responses use aggregate='sources' which skips the slower enrichment."
+            ),
+        }
     except InvalidInput as e:
         result = {"status": "error", "error_type": "invalid_input", "message": str(e)}
     except AuthError as e:
