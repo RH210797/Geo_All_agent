@@ -1,215 +1,178 @@
 # Mint.ai Visibility MCP Server
 
-MCP server for analyzing brand visibility in LLM responses via the Mint.ai API.
+MCP server that exposes Mint.ai brand-visibility data (scores, share of voice, cited sources, page enrichment) to any MCP-compatible client — Claude Desktop, Claude.ai (SSE), or a custom agent.
 
-**Version 4.2.0** — Lightweight catalog + per-topic model discovery: `mint_get_domains_and_topics` now returns slim domains (id + displayName only), new `mint_get_models_by_topic` tool, GLOBAL-by-default with deep-dive offer.
+**Version 5.2.0** — Owned-domain fix (corporate domains like `accor.com` are now owned on every topic), request throttling to protect the API, and a leaner `mint_get_topic_overview`. Builds on v5.1.0 (macro `mint_get_topic_overview`) and v5.0.0 (split source tools).
+
+---
+
+## Tool map (9 exposed)
+
+| # | Tool | Level | One-liner |
+|---|------|-------|-----------|
+| 1 | `mint_get_domains_and_topics` | discovery | List brands (domains) + markets (topics) and their IDs. **Call first.** |
+| 2 | `mint_get_models_by_topic` | discovery | List the AI models available for one topic. |
+| 3 | `mint_get_topic_overview` | **macro** | One-call snapshot: score, share of voice, rank, competitors, top mentions. |
+| 4 | `mint_get_topic_scores` | detail | Day-by-day Brand vs Competitors scores, per model. |
+| 5 | `mint_get_scores_overview` | macro | Average score for **many** topics in one table. |
+| 6 | `mint_get_visibility_trend` | detail | Binned time-series for charts. |
+| 7 | `mint_get_topic_sources` | detail | Top cited domains/URLs (per model, over time). |
+| 8 | `mint_get_response_sources` | **macro (sources)** | Fast cited-source overview, citation-weighted, owned vs external. No crawl. |
+| 9 | `mint_enrich_cited_sources` | **detail (sources)** | Crawls pages (DataForSEO); ranks external sources by how much they cite your brand. |
+
+Design principle: every area has a **macro** entry (fast, one call) and a **detail** tool. The macro tools point to the detail tools via a `next_step` field. `mint_get_raw_responses` and `mint_enrich_sources` remain callable as **unlisted backward-compat aliases**.
 
 ---
 
-## Tools (8)
-
----
+## Tools
 
 ### 1. `mint_get_domains_and_topics`
+Lists every domain (brand) and topic (market) with their IDs. Every other tool needs a `domainId` / `topicId` from here.
 
-Lists all domains (brands) and topics (markets). **Call first** to get IDs needed by other tools.
-
-Two-step internally: `GET /domains` (kept slim — only `id` + `displayName`, the rest of the domain payload is too large) then `GET /domains/{id}/topics` per domain.
-
-| Annotation | Value |
-|---|---|
-| readOnlyHint | true |
-| idempotentHint | true |
-
-**Examples:** "What brands do I have?", "List my topics"
-
-**Returns:**
-```json
-{
-  "domains": [{"domainId": "694a...", "domainName": "IBIS"}],
-  "topics": [{"domainId": "...", "domainName": "IBIS", "topicId": "...", "topicName": "IBIS FR"}],
-  "mapping": {"IBIS > IBIS FR": {"domainId": "694a...", "topicId": "694a..."}},
-  "errors": []
-}
-```
-
----
+- **Params:** none.
+- **Returns:** `domains` (id+name), `topics` (domainId, domainName, topicId, topicName), a `"Brand > Topic" → IDs` mapping, `errors`.
 
 ### 2. `mint_get_models_by_topic`
+The AI models tracked for one topic (resolved live — each topic can differ).
 
-Lists the AI models available for **one topic**. Each topic can have its own set of models, so they are resolved live from the topic's visibility endpoint (not hardcoded).
-
-| Param | Required | Description |
+| Param | Req | Description |
 |---|---|---|
-| `domainId` | yes | Domain ID |
-| `topicId` | yes | Topic ID |
+| `domainId` | yes | from tool 1 |
+| `topicId` | yes | from tool 1 |
 
-| Annotation | Value |
-|---|---|
-| readOnlyHint | true |
-| idempotentHint | true |
+Use the returned names in the `models` param of other tools (comma-separated, no spaces). By default other tools answer with the GLOBAL (all-models) view; offer a per-model deep dive only on request.
 
-**Behavior:** By default, score/analysis tools return the GLOBAL (combined) view. The assistant should close each such answer by offering a per-model deep dive (e.g. "Want a deep dive on a specific model?"). Only when the user accepts, call this tool to list the topic's models, then pass them to the `models` param of `mint_get_topic_scores` / `mint_get_topic_sources`.
+### 3. `mint_get_topic_overview` — macro snapshot
+One call to `/visibility/aggregated`, no per-model fan-out. Headline KPIs only; the heavy time-series and full domain/URL lists are intentionally left to the detail tools.
 
-**Returns:**
+| Param | Req | Description |
+|---|---|---|
+| `domainId`, `topicId` | yes | target topic |
+| `startDate` / `endDate` | no | default last 30 days |
+| `models` | no | omit = GLOBAL |
+| `top_n` | no | rows for `top_mentions` (default 10) |
+| `include_model_breakdown` | no | per-model score arrays (default true) |
+| `useAllModelsForCompetitors` | no | count missing models as 0 (default false) |
+
+**Returns:** `kpis` (averageScore, scoreVariation, brand_rank, entities_ranked, `share_of_voice` {latest, average, change…}, totals), `available_models`, `model_breakdown`, `competitors` [{name, averageScore, variation}], `top_mentions` (share of voice by mention count), `next_step`.
+
+> Surfaces `shareOfVoice` and `topMentions` that no other tool exposes. (The always-zero `domainSourceAnalysis` block was removed in v5.2.0.)
+
+### 4. `mint_get_topic_scores` — detail
+Day-by-day Brand vs Competitors scores for one topic, broken down by AI model (GLOBAL + each model).
+
+| Param | Req | Description |
+|---|---|---|
+| `domainId`, `topicId` | yes | target topic |
+| `startDate` / `endDate` | no | default last 30 days |
+| `models` | no | comma-separated filter |
+
+**Returns:** flat `dataset` `[{Date, EntityName, EntityType, Score, Model}, …]`.
+
+### 5. `mint_get_scores_overview` — multi-topic table
+Average score per topic over a period, as a Markdown table + JSON rows. Resolves topics itself from filters.
+
+| Param | Req | Description |
+|---|---|---|
+| `brand_filter` / `market_filter` / `topic_ids` | no | topic selection |
+| `startDate` / `endDate` | no | default last 90 days |
+| `models` | no | filter |
+
+### 6. `mint_get_visibility_trend` — chart series
+Binned (day/week/month) time-series shaped for line charts.
+
+| Param | Req | Description |
+|---|---|---|
+| `brand_filter` / `market_filter` / `topic_ids` | no | selection |
+| `granularity` | no | day / **week** / month |
+| `aggregation` | no | **average** / per_topic |
+| `startDate` / `endDate` / `models` | no | filters |
+
+### 7. `mint_get_topic_sources` — detail sources
+Top cited domains and URLs for one topic, per model and over time (Mint's pre-aggregated API, fast). Answers "who is cited / how often", not "does the page mention my brand".
+
+| Param | Req | Description |
+|---|---|---|
+| `domainId`, `topicId` | yes | target topic |
+| `startDate` / `endDate` / `models` | no | filters |
+
+**Returns:** `top_domains`, `top_urls`, `domains_over_time`, `urls_over_time`, `global_metrics`.
+
+### 8. `mint_get_response_sources` — fast source overview *(no crawl)*
+Reads raw LLM responses and reports which sources are cited, split **owned vs external** and by **whether your brand was named in the answer**. All counts are **citation-weighted** (a URL cited 80× counts 80). No DataForSEO.
+
+| Param | Req | Description |
+|---|---|---|
+| `domainId` | yes | target domain |
+| `topic_ids` / `brand_filter` / `market_filter` | no | topic selection (default: all topics of the domain) |
+| `response_brand_mentioned` | no | `true` / `false` / `all` — `false` answers "who replaces me" |
+| `ownership_filter` | no | `owned` / `external` / `all` |
+| `startDate` / `endDate` / `models` / `latestOnly` | no | filters |
+| `top_n` | no | rows per ranking (default 30) |
+
+**Returns:** `top_domains`, `top_urls` (carry `report_ids`), `top_of_mind`, `ownership_summary`, `brand_mentioned_split`, `matrix` (ownership × response_brand_mentioned), and `next_step.sources` (external URLs ready to enrich).
+
+> Owned/external relies on `owned_domains.json` (see Config). Without it, everything is `external`.
+
+### 9. `mint_enrich_cited_sources` — deep source enrichment *(crawl)*
+Crawls cited pages via **DataForSEO** to detect brand vs competitors **in the page content**, and ranks external sources by **how much each one cites your brand** (`brand_citation_ranking`). Slower/paid — use after tool 8.
+
+| Param | Req | Description |
+|---|---|---|
+| `domainId` | yes | target domain |
+| `sources` | no | EXPLICIT mode: `[{url, reportId, topicId?}]` (e.g. tool 8's `next_step.sources`) |
+| `topic_ids` / `brand_filter` / `market_filter` | no | AUTO mode topic selection |
+| `source_scope` | no | `external` (default) / `owned` / `all` |
+| `response_brand_mentioned` | no | AUTO filter before ranking |
+| `top_n` | no | URLs to enrich (default 50, max 300) — **each is a crawl** |
+| `brand_name` | no | override brand for owned/external |
+
+**Returns:** `classified_sources` (with `source_content_brand_status`: own_only / own+comp / comp_only / no_brand / not_enriched), **`brand_citation_ranking`**, `matrix` (ownership × source_content_brand_status), `summary`.
+
+> Distinguishes `response_brand_mentioned` (the LLM answer) from `source_content_brand_status` (the cited page). Per-page brand counts are de-duplicated (max per page), never multiplied by the number of citing reports.
+
+---
+
+## Configuration
+
+### Owned domains (`owned_domains.json`)
+Drives the owned/external axis independently of crawling. The server **UNIONs** each brand's list with `_default`, so a shared corporate domain applies to **every topic**. Subdomains match automatically (`accor.com` ⇒ `all.accor.com`, `ibis.accor.com`, …).
+
 ```json
 {
-  "domainId": "694a...",
-  "topicId": "694a...",
-  "models": ["gpt-5.1", "sonar-pro", "gemini-3-pro-preview", "..."],
-  "count": 6,
-  "note": "..."
+  "_default": ["accor.com"],
+  "IBIS":     ["accor.com", "ibis.com"],
+  "Sofitel":  ["accor.com", "sofitel.com"]
 }
 ```
 
----
+To add a brand: edit the file and restart. Point to it with `OWNED_DOMAINS_PATH` if it is not next to the server file.
 
-### 3. `mint_get_topic_scores`
+### Environment variables
 
-Day-by-day Brand vs Competitors scores for **one topic**, broken down by AI model.
-
-| Param | Required | Description |
-|---|---|---|
-| `domainId` | yes | Domain ID |
-| `topicId` | yes | Topic ID |
-| `startDate` | no | YYYY-MM-DD (default: -30 days) |
-| `endDate` | no | YYYY-MM-DD (default: today) |
-| `models` | no | Comma-separated filter (e.g. `gpt-5.1,sonar-pro`) |
-
-**Returns:** flat dataset `[{Date, EntityName, EntityType, Score, Model}, ...]`
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `MINT_API_KEY` | yes | — | Mint.ai API key |
+| `MINT_BASE_URL` | no | `https://api.getmint.ai/api` | Base URL |
+| `HTTP_TIMEOUT` | no | `30` | Per-request read timeout (s) |
+| `HTTP_MAX_CONCURRENT` | no | `8` | Max concurrent requests |
+| `HTTP_MIN_INTERVAL` | no | `0.15` | **Min delay between request starts (s)** — throttle to avoid overloading the API; `0` disables |
+| `TOOL_TIMEOUT` | no | `120` | Hard ceiling per tool call (s) |
+| `OWNED_DOMAINS_PATH` | no | `./owned_domains.json` | Owned-domains mapping |
 
 ---
 
-### 4. `mint_get_scores_overview`
-
-Average visibility score for **multiple topics** in one call. Self-contained: fetches topics via filters.
-
-| Param | Required | Description |
-|---|---|---|
-| `brand_filter` | no | e.g. `IBIS`, `Mercure` |
-| `market_filter` | no | e.g. `FR`, `UK` |
-| `topic_ids` | no | Explicit topicId list |
-| `startDate` / `endDate` | no | Default: -90 days |
-| `models` | no | Comma-separated filter |
-
-**Returns:** Markdown table + JSON rows with avg scores per topic.
-
----
-
-### 5. `mint_get_visibility_trend`
-
-**Binned time series** (day/week/month) for line charts.
-
-| Param | Required | Description |
-|---|---|---|
-| `brand_filter` / `market_filter` / `topic_ids` | no | Topic selection |
-| `startDate` / `endDate` | no | Default: Jan 1st current year to today |
-| `models` | no | Model filter |
-| `granularity` | no | `day` / `week` (default) / `month` |
-| `aggregation` | no | `average` (default) / `per_topic` |
-
-**Returns:**
-```json
-{
-  "series": [{"name": "IBIS (week avg)", "points": [{"date": "2026-01-06", "score": 52.3, "n": 45}]}],
-  "chart_hint": "line"
-}
-```
-
----
-
-### 6. `mint_get_topic_sources`
-
-Top cited domains and URLs for **one topic**, per AI model. Uses Mint's pre-aggregated API (fast).
-
-| Param | Required | Description |
-|---|---|---|
-| `domainId` | yes | Domain ID |
-| `topicId` | yes | Topic ID |
-| `startDate` / `endDate` | no | Default: -90 days |
-| `models` | no | Model filter |
-
-**Returns:** `top_domains`, `top_urls`, `domains_over_time`, `urls_over_time`, `global_metrics`
-
----
-
-### 7. `mint_get_raw_responses` (core)
-
-Classifies every cited URL on **2 independent axes**:
-
-**Axis 1 — ownership** (domain regex):
-- `owned` — URL on a brand-owned domain (e.g. `all.accor.com`)
-- `external` — third-party domain (e.g. `booking.com`)
-
-**Axis 2 — brand_status** (via crawl enrichment):
-- `own_only` — page mentions your brand only
-- `own+comp` — page mentions your brand AND competitors
-- `comp_only` — page mentions only competitors
-- `no_brand` — crawl ran, no brand detected
-- `not_enriched` — no crawl data
-
-**3 modes** via `aggregate`:
-- `classified` (default) — full enrichment + classification + cross matrix
-- `sources` — top domains/URLs without enrichment (faster)
-- `none` — raw responses for drill-down
-
-| Param | Required | Description |
-|---|---|---|
-| `domainId` | yes | Domain ID |
-| `topic_ids` / `brand_filter` / `market_filter` | no | Topic selection |
-| `response_brand_mentioned` | no | `true` / `false` / `all` (default) |
-| `ownership_filter` | no | `owned` / `external` / `all` (default) |
-| `brand_status_filter` | no | String or list from the 5 statuses |
-| `aggregate` | no | `classified` / `sources` / `none` |
-| `top_n` | no | Max URLs (default: 30, max: 500) |
-
-**Example queries:**
-```json
-// "External sources mentioning my brand"
-{"domainId": "...", "ownership_filter": "external", "brand_status_filter": ["own_only", "own+comp"]}
-
-// "When IBIS is NOT cited, who takes my place?"
-{"domainId": "...", "response_brand_mentioned": "false", "aggregate": "sources"}
-```
-
----
-
-### 8. `mint_enrich_sources`
-
-Direct batch URL enrichment: DataForSEO category + detected brands.
-
-| Param | Required | Description |
-|---|---|---|
-| `domainId` | yes | Domain ID |
-| `urls` | yes | URL list (max 1000) |
-| `reportId` | yes | Report ID |
-| `topicId` | no | Resolves market/language |
-| `brand_name` | no | Adds owned/external classification |
-
-> For typical analysis, prefer `mint_get_raw_responses(aggregate="classified")`.
-
----
-
-## Installation
+## Install & run
 
 ```bash
-pip install -r requirements.txt
-```
-
-## Local launch
-
-```bash
-export MINT_API_KEY="mint_live_your_key_here"
+pip install -r requirements.txt          # or: pip install "httpx[socks]" socksio mcp starlette
+export MINT_API_KEY="mint_live_..."
 uvicorn mcp_mint_server:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
-Endpoints:
-- `GET /health` — JSON healthcheck
-- `GET /sse` — SSE connection (Claude.ai, web MCP clients)
-- `POST /sse` + `POST /messages` — JSON-RPC messages
+Endpoints: `GET /health`, `GET /sse` (Claude.ai / web clients), `POST /sse` + `POST /messages` (JSON-RPC).
 
-## Claude Desktop config
-
+### Claude Desktop
 ```json
 {
   "mcpServers": {
@@ -217,102 +180,41 @@ Endpoints:
       "command": "python",
       "args": ["-m", "uvicorn", "mcp_mint_server:app", "--port", "8765"],
       "cwd": "/absolute/path/to/mint-mcp",
-      "env": {
-        "MINT_API_KEY": "mint_live_your_key_here"
-      }
+      "env": { "MINT_API_KEY": "mint_live_..." }
     }
   }
 }
 ```
 
-## Render deployment
+### Render
+Build `pip install -r requirements.txt` · Start `uvicorn mcp_mint_server:app --host 0.0.0.0 --port $PORT --workers 1` · set `MINT_API_KEY` · connect Claude.ai to `https://<app>.onrender.com/sse`.
 
-1. Push to GitHub
-2. Render: New Web Service, connect repo
-3. Build: `pip install -r requirements.txt`
-4. Start: `uvicorn mcp_mint_server:app --host 0.0.0.0 --port $PORT --workers 1`
-5. Set `MINT_API_KEY` in Environment
-6. Deploy
+---
 
-Connect in Claude.ai: `https://<your-app>.onrender.com/sse`
+## Testing
 
-## Project structure
+- **Notebook:** `test_mint_tools.ipynb` — runs all 9 tools cell by cell with pandas tables. Launch Jupyter in this folder, paste your key in the Setup cell, run.
+- **CLI:** `python test_live.py [domainId topicId]` — PASS/FAIL per tool.
 
-```
-.
-├── mcp_mint_server.py   # Complete MCP server (single file)
-├── owned_domains.json   # Brand → owned domains mapping
-├── requirements.txt     # Dependencies
-├── .gitignore
-└── README.md
-```
+Both need network access to `api.getmint.ai`.
 
-## Owned Domains config
-
-`owned_domains.json` maps each brand to its owned domains. This provides the `ownership` axis independently of the crawl enrichment.
-
-```json
-{
-  "IBIS":     ["accor.com"],
-  "Fairmont": ["accor.com", "fairmont.com"],
-  "_default": ["accor.com"]
-}
-```
-
-To add a brand: edit the file and restart.
-
-## Environment variables
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `MINT_API_KEY` | yes | — | Mint.ai API key |
-| `MINT_BASE_URL` | no | `https://api.getmint.ai/api` | Base URL |
-| `HTTP_TIMEOUT` | no | `30` | Timeout (seconds) |
-| `HTTP_MAX_CONCURRENT` | no | `8` | Max concurrent API requests |
-| `OWNED_DOMAINS_PATH` | no | `./owned_domains.json` | Mapping file path |
-
-## Backward compatibility
-
-Tool names are prefixed with `mint_` (e.g. `mint_get_topic_scores`). The old unprefixed names (e.g. `get_topic_scores`, `get_models_by_topic`) still work as aliases — no breaking change for existing clients.
+---
 
 ## Changelog
 
-### v4.2.0 (2026-06-01) — Slim catalog + per-topic models
+### v5.2.0 — Owned-domain fix + throttling
+- **FIX**: owned/external now UNIONs brand patterns with `_default`, so corporate domains (`accor.com` → `all.accor.com`, `ibis.accor.com`) are owned on every topic. Ships `owned_domains.json`.
+- **PERF**: `HTTP_MIN_INTERVAL` throttle (default 0.15 s) spaces request starts.
+- **CLEAN**: `mint_get_topic_overview` no longer returns `domain_source_analysis` (Mint reports it as 0%).
 
-- **NEW**: `mint_get_models_by_topic` — lists the AI models available for a topic, resolved live (each topic can have its own models)
-- **CHANGE**: `mint_get_domains_and_topics` now returns slim domains (`domainId` + `domainName` only) instead of the full domain payload — same output structure, much smaller response
-- **BEHAVIOR**: score/analysis tools return GLOBAL by default; the assistant offers a per-model deep dive and only fetches models on user request
-- **DOCS**: README updated, tool count 7 → 8
-- **COMPAT**: backward-compatible alias `get_models_by_topic`; same deploy process
+### v5.1.0 — Macro topic overview
+- **NEW**: `mint_get_topic_overview` — one-call macro snapshot (score, share of voice, rank, model breakdown, competitors, top mentions). Surfaces `shareOfVoice` / `topMentions`. Tool count 8 → 9.
 
-### v4.1.0 (2026-04-20) — Hardened & Optimized
+### v5.0.0 — Split source analysis
+- Split `mint_get_raw_responses` into `mint_get_response_sources` (fast) + `mint_enrich_cited_sources` (deep). Citation-weighted metrics, per-report `topicId` fix, page counts no longer multiplied. Old tools kept as unlisted aliases.
 
-- **PERF**: Persistent `httpx.AsyncClient` with connection pooling and TLS reuse
-- **PERF**: Starlette `on_startup`/`on_shutdown` lifecycle for HTTP client management
-- **ROBUST**: Input validation on all tool arguments with clear error messages
-- **ROBUST**: Tool names prefixed with `mint_` to avoid collisions
-- **ROBUST**: Tool annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`)
-- **ROBUST**: New `InvalidInput` error type caught in dispatcher
-- **DOCS**: Tool descriptions rewritten in English with USE FOR / DON'T USE FOR
-- **DOCS**: README rewritten in English
-- **FIX**: Server name follows Python convention (`mint_visibility_mcp`)
-- **COMPAT**: Backward-compatible aliases for v4.0.0 unprefixed tool names
-- **COMPAT**: SSE transport preserved (Render + Claude.ai compatible)
-- **COMPAT**: Same deploy process — just push and go
+### v4.2.0 — Slim catalog + per-topic models
+- `mint_get_models_by_topic`; slim domains in the catalog; GLOBAL-by-default.
 
-### v4.0.0 (2026-04-16) — Sources Classification
-
-Major rewrite. Not backward-compatible with v3.x.
-
-- 7 specialized tools (from 4)
-- 2-axis classification (ownership + brand_status)
-- `get_visibility_trend` for temporal charts
-- `get_raw_responses` with 3 modes
-- `owned_domains.json` external config
-- Strict `(reportId, url)` coupling (v3.x bug fix)
-- Typed errors, exponential retry, global semaphore
-- `/health` endpoint
-
-### v3.6.0 — v3.0.0
-
-See previous releases for v3.x changelog.
+### v4.1.0 — Hardened
+- Persistent HTTP client, input validation, typed errors + retry, tool annotations, SSE preserved.

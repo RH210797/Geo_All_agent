@@ -1,11 +1,15 @@
 {
-  "_comment": "Mapping brand (domain.displayName Mint) → domaines propriétaires. Utilisé pour classifier une URL comme 'owned' vs 'external'. Le fallback _default s'applique aux brands non listées.",
-  "IBIS":     ["accor.com"],
-  "Mercure":  ["accor.com"],
-  "Novotel":  ["accor.com"],
-  "Pullman":  ["accor.com"],
-  "Sofitel":  ["accor.com"],
-  "Raffles":  ["accor.com", "raffles.com"],
+  "_comment": "Maps each brand to its OWNED web domains. The server UNIONs the brand-specific list with _default, so _default applies to every topic. Subdomains match automatically (accor.com also matches all.accor.com, ibis.accor.com, group.accor.com).",
+  "_default": ["accor.com"],
+  "IBIS": ["accor.com", "ibis.com"],
+  "Novotel": ["accor.com", "novotel.com"],
+  "Mercure": ["accor.com", "mercure.com"],
+  "Sofitel": ["accor.com", "sofitel.com"],
+  "Pullman": ["accor.com", "pullman.com", "pullmanhotels.com"],
   "Fairmont": ["accor.com", "fairmont.com"],
-  "_default": ["accor.com"]
+  "Raffles": ["accor.com", "raffles.com"],
+  "Swissotel": ["accor.com", "swissotel.com"],
+  "MGallery": ["accor.com", "mgallery.com"],
+  "Mövenpick": ["accor.com", "movenpick.com"],
+  "Adagio": ["accor.com", "adagio-city.com"]
 }
