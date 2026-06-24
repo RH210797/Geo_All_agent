@@ -1747,6 +1747,8 @@ async def _tool_enrich_cited_sources(args: dict) -> dict:
     explicit = args.get("sources")
     brand_name_arg = optional_str(args, "brand_name")
     top_n = optional_int(args, "top_n", default=50, min_val=1, max_val=300)
+    crawl_all = optional_bool(args, "crawl_all", False)
+    max_reports_per_url = optional_int(args, "max_reports_per_url", default=3, min_val=1, max_val=50)
     source_scope = optional_enum(args, "source_scope", {"external", "owned", "all"}, "external")
     response_brand_mentioned = optional_enum(
         args, "response_brand_mentioned", {"true", "false", "all"}, "all")
@@ -1817,7 +1819,7 @@ async def _tool_enrich_cited_sources(args: dict) -> dict:
                 if rid:
                     url_reports_tmp[u].add(rid)
 
-        ranked = [u for u, _ in url_cit.most_common(top_n)]
+        ranked = [u for u, _ in url_cit.most_common(None if crawl_all else top_n)]
         for u in ranked:
             for rid in url_reports_tmp[u]:
                 report_urls[rid].append(u)
@@ -1833,18 +1835,53 @@ async def _tool_enrich_cited_sources(args: dict) -> dict:
                          "message": "No URLs to enrich for the given scope."},
         }
 
-    # ─── Enrich per reportId, passing the CORRECT topicId per report ───
-    async def one_report(rid):
-        urls = list(set(report_urls[rid]))
-        if not urls:
-            return {}
-        data = await _enrich_report_batch(domain_id, rid, urls, topic_id=report_topic.get(rid))
-        return {(rid, url): payload for url, payload in data.items()}
+    # ─── Optimised enrichment: each URL only needs ONE crawl hit ───
+    # A page content is the same whatever report cites it, and crawl results are
+    # stored per (reportId, url). Enriching every couple is hugely redundant
+    # (same url x N reports). Instead we try each URL against ONE report at a time
+    # and STOP at the first real crawl hit; URLs still missing crawl data fall back
+    # to the next report that cites them, up to max_reports_per_url passes. This
+    # collapses thousands of couples into a few hundred lookups, full coverage kept.
+    def _has_crawl(payload) -> bool:
+        return isinstance(payload, dict) and any(
+            k in payload for k in ("contentLength", "wordCount", "detectedBrands",
+                                   "contentLinks", "publicationDate", "lastCheckedAt"))
 
-    enrich_results = await asyncio.gather(*[one_report(rid) for rid in report_urls])
-    enriched_by_couple: dict = {}
-    for batch in enrich_results:
-        enriched_by_couple.update(batch)
+    url_candidates: dict[str, list] = defaultdict(list)
+    for rid, urls in report_urls.items():
+        for u in set(urls):
+            url_candidates[u].append(rid)
+
+    resolved: dict = {}          # url -> payload that HAS crawl data
+    fallback: dict = {}          # url -> first category-only payload (no crawl)
+    attempt: dict = defaultdict(int)
+    lookups_done = 0
+
+    for _pass in range(max_reports_per_url):
+        todo: dict[str, list] = defaultdict(list)
+        for u, cands in url_candidates.items():
+            if u in resolved:
+                continue
+            idx = attempt[u]
+            if idx < len(cands):
+                todo[cands[idx]].append(u)
+                attempt[u] = idx + 1
+        if not todo:
+            break
+
+        async def _one(rid, urls):
+            return rid, urls, await _enrich_report_batch(
+                domain_id, rid, urls, topic_id=report_topic.get(rid))
+
+        for rid, urls, data in await asyncio.gather(*[_one(rid, us) for rid, us in todo.items()]):
+            lookups_done += (len(urls) + 99) // 100
+            for u, payload in data.items():
+                if _has_crawl(payload):
+                    resolved[u] = payload
+                elif u not in fallback:
+                    fallback[u] = payload
+
+    final_payload = {u: (resolved.get(u) or fallback.get(u) or {}) for u in url_candidates}
 
     # ─── Aggregate per URL ───
     url_to_agg: dict = defaultdict(lambda: {
@@ -1854,13 +1891,15 @@ async def _tool_enrich_cited_sources(args: dict) -> dict:
         "own_brand_counts": defaultdict(int), "comp_brand_counts": defaultdict(int),
         "categories": set(),
         "couples_enriched": 0, "couples_total": 0,
+        "has_crawl": False,
     })
-    for rid, urls in report_urls.items():
-        for u in set(urls):
-            url_to_agg[u]["couples_total"] += 1
-    for (rid, u), data in enriched_by_couple.items():
+    for u, cands in url_candidates.items():
         agg = url_to_agg[u]
-        agg["couples_enriched"] += 1
+        agg["couples_total"] = len(cands)
+        data = final_payload.get(u) or {}
+        agg["couples_enriched"] = 1 if data else 0
+        if _has_crawl(data):
+            agg["has_crawl"] = True
         if data.get("sourceCategory"):
             agg["categories"].add(data["sourceCategory"])
         for b in (data.get("detectedBrands") or []):
@@ -1890,6 +1929,8 @@ async def _tool_enrich_cited_sources(args: dict) -> dict:
             "source_content_brand_status": st,
             "own_brands": sorted(agg["own_brand_counts"]),
             "comp_brands": sorted(agg["comp_brand_counts"]),
+            "own_brand_counts": dict(agg["own_brand_counts"]),
+            "comp_brand_counts": dict(agg["comp_brand_counts"]),
             "brand_mention_count": sum(agg["own_brand_counts"].values()),
             "competitor_mention_count": sum(agg["comp_brand_counts"].values()),
             "citations": url_cit.get(u),  # None in explicit mode
@@ -1927,21 +1968,71 @@ async def _tool_enrich_cited_sources(args: dict) -> dict:
     total_row["TOTAL"] = sum(total_row[s] for s in statuses)
     matrix_rows.append(total_row)
 
+    # ─── Flat table: one row per URL (brand mentioned | competitors | category) ───
+    def _fmt_counts(d: dict) -> str:
+        """'IBIS (8), Campanile (2)' — names with page mention counts, biggest first."""
+        return ", ".join(f"{n} ({c})" for n, c in sorted(d.items(), key=lambda kv: -kv[1]))
+
+    def _short_category(cat, depth: int = 2) -> str:
+        """Trim the long DataForSEO path to its top levels for readable display."""
+        if not cat:
+            return ""
+        first = cat.split(" | ")[0]
+        return " > ".join(p.strip() for p in first.split(">")[:depth])
+
+    table = [
+        {
+            "url": c["url"],
+            "brand": brand_name,                               # tracked brand of the topic
+            "brand_mentioned": _fmt_counts(c["own_brand_counts"]),    # e.g. "IBIS (8)"
+            "competitors_cited": _fmt_counts(c["comp_brand_counts"]),
+            "category": c["category"],
+        }
+        for c in classified
+    ]
+
+    md = ["| URL | Brand mentioned | Competitors cited | Category |",
+          "|-----|-----------------|-------------------|----------|"]
+    for c in classified:
+        bm = _fmt_counts(c["own_brand_counts"]) or "—"
+        comp = _fmt_counts(c["comp_brand_counts"]) or "—"
+        cat = _short_category(c["category"]) or "—"
+        u = c["url"] if len(c["url"]) <= 70 else c["url"][:67] + "…"
+        md.append(f"| {u} | {bm} | {comp} | {cat} |")
+    markdown_table = "\n".join(md)
+
+    brands_found = summary.get("own_only", 0) + summary.get("own+comp", 0) + summary.get("comp_only", 0)
+    diagnostic = None
+    if brands_found == 0 and url_to_agg:
+        diagnostic = (
+            f"0 brand detected across {len(url_to_agg)} URL(s). Enrichment ran fine "
+            f"(enrichment_lookups={lookups_done}) but the top-cited URLs are likely "
+            "brandless infrastructure pages (map tiles, booking/parking, etc.). "
+            "Raise top_n (e.g. 50-100) so brand-bearing sources are included, or change source_scope."
+        )
+
     return {
         "status": "success",
+        "table": table,                 # one row per URL: brand / competitors / category
+        "markdown_table": markdown_table,
         "classified_sources": classified,
         "brand_citation_ranking": brand_citation_ranking,
         "matrix": matrix_rows,
         "summary": {s: summary.get(s, 0) for s in statuses},
         "metadata": {
             "mode": mode,
+            "diagnostic": diagnostic,
             "brand_name": brand_name,
             "owned_patterns": owned_patterns,
             "source_scope": source_scope if mode == "auto" else "explicit",
             "responses_scanned": scanned,
             "unique_urls": len(url_to_agg),
+            "crawled_urls": sum(1 for a in url_to_agg.values() if a["has_crawl"]),
+            "category_only_urls": sum(1 for a in url_to_agg.values() if not a["has_crawl"]),
+            "crawl_all": crawl_all,
             "couples_total": sum(len(set(v)) for v in report_urls.values()),
-            "couples_enriched": len(enriched_by_couple),
+            "enrichment_lookups": lookups_done,
+            "max_reports_per_url": max_reports_per_url,
             "filters": {"response_brand_mentioned": response_brand_mentioned},
             "note": "source_content_brand_status comes from crawling the PAGE — "
                     "distinct from response_brand_mentioned (the LLM answer).",
@@ -2317,6 +2408,8 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
                 },
                 "brand_name": {"type": "string", "description": "Override the brand used for owned/external classification. Optional (defaults to the domain's brand)."},
                 "top_n": {"type": "integer", "description": "AUTO mode: number of top cited URLs to enrich. Default: 50, max: 300. Every URL is a crawl."},
+                "crawl_all": {"type": "boolean", "description": "AUTO mode: enrich ALL in-scope cited URLs (ignores top_n), batched by 100. Heavy/slow on large scopes - may exceed TOOL_TIMEOUT; for full coverage prefer a standalone run. Default: false."},
+                "max_reports_per_url": {"type": "integer", "description": "AUTO mode: how many different reports to try per URL to find a stored crawl (stops at the first crawl hit). Higher = better long-tail coverage, more lookups. Default: 3, max: 50."},
             },
             "required": ["domainId"],
         },
