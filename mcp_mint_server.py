@@ -1,5 +1,25 @@
 """
-Mint.ai Visibility MCP Server — v5.2.0 (Owned-domain fix + throttling)
+Mint.ai Visibility MCP Server — v5.3.0 (Competition tools + optimised enrichment)
+
+WHAT'S NEW IN v5.3.0
+═══════════════════════════════════════════════════════════════════
+NEW    - mint_get_competition_overview: MACRO head-to-head win rate (wins/losses/
+         ties/win%), split by competitor and by model, plus brand strengths &
+         weaknesses. Wraps GET /competition/aggregated. 'Who wins between my
+         brand and its rivals on this topic?'
+NEW    - mint_get_competition_responses: DETAIL competition prompts + LLM answers
+         (winner, reasoning, strengths, weaknesses), paginated, with winner_filter.
+         Wraps GET /competition/raw-results. For showing concrete examples.
+PERF   - mint_enrich_cited_sources rewritten: each URL is enriched only until the
+         FIRST report holding its stored crawl (greedy cover), not every
+         (reportId, url) couple. Thousands of redundant lookups -> a few hundred,
+         same coverage. New param max_reports_per_url (default 3).
+NEW    - mint_enrich_cited_sources: crawl_all=true enriches ALL in-scope URLs
+         (ignores top_n), batched by 100. New metadata crawled_urls vs
+         category_only_urls + enrichment_lookups. Output now carries a flat
+         `table` + `markdown_table` (url | brand_mentioned | competitors |
+         category) and a metadata.diagnostic when 0 brand is detected.
+═══════════════════════════════════════════════════════════════════
 
 ═══════════════════════════════════════════════════════════════════
 WHAT'S NEW IN v5.2.0
@@ -76,7 +96,7 @@ COMPAT — SSE transport preserved (Render + Claude.ai compatible).
          No breaking change on wire protocol or deploy process.
 ═══════════════════════════════════════════════════════════════════
 
-Tools (9 exposed):
+Tools (11 exposed):
   mint_get_domains_and_topics  — catalog discovery
   mint_get_models_by_topic     — list AI models for one topic
   mint_get_topic_overview      — v5.1: one-call MACRO snapshot (score, SoV, competitors, source mix)
@@ -86,6 +106,8 @@ Tools (9 exposed):
   mint_get_topic_sources       — top cited domains/URLs, 1 topic
   mint_get_response_sources    — v5: FAST cited-source overview, weighted, no enrichment
   mint_enrich_cited_sources    — v5: DEEP page enrichment, ranks sources citing your brand
+  mint_get_competition_overview  - v5.3: MACRO head-to-head win rate, strengths, weaknesses
+  mint_get_competition_responses - v5.3: DETAIL competition prompts + LLM answers (examples)
 
 Unlisted but callable (backward compat): mint_get_raw_responses, mint_enrich_sources
 
@@ -154,7 +176,7 @@ _HTTP_SEMAPHORE = asyncio.Semaphore(HTTP_MAX_CONCURRENT)
 _RATE_LOCK = asyncio.Lock()
 _last_request_ts: float = 0.0
 
-__version__ = "5.2.0"
+__version__ = "5.3.0"
 
 server = Server("mint_visibility_mcp")
 
@@ -2044,8 +2066,163 @@ async def _tool_enrich_cited_sources(args: dict) -> dict:
 # MCP TOOL DECLARATIONS
 # ══════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════
+# TOOL — mint_get_competition_overview (MACRO head-to-head)
+# ══════════════════════════════════════════════════════════════════
+
+async def _tool_get_competition_overview(args: dict) -> dict:
+    """Macro head-to-head competition snapshot for ONE topic.
+
+    Wraps GET /competition/aggregated: overall win/loss/tie + win%, the same
+    split by competitor and by model, plus the brand's recurring strengths and
+    weaknesses categories. Answers 'who wins between my brand and its rivals'.
+    """
+    domain_id = require_str(args, "domainId")
+    topic_id = require_str(args, "topicId")
+    start_date = optional_str(args, "startDate")
+    end_date = optional_str(args, "endDate")
+    models = optional_str(args, "models")
+    competitors = optional_str(args, "competitors")
+
+    params: dict[str, Any] = {}
+    if start_date:   params["startDate"] = start_date
+    if end_date:     params["endDate"] = end_date
+    if models:       params["models"] = models
+    if competitors:  params["competitors"] = competitors
+
+    endpoint = f"/domains/{domain_id}/topics/{topic_id}/competition/aggregated"
+    data = await fetch_get(endpoint, params)
+
+    wra = data.get("winRateAnalysis") or {}
+    overall = wra.get("overall") or {}
+    md = data.get("metadata") or {}
+    dr = md.get("dateRange") or {}
+    ds, de = dr.get("start"), dr.get("end")
+    if ds and de and ds > de:
+        ds, de = de, ds
+
+    def _slim(block):
+        block = block or {}
+        return {
+            "topCategories": block.get("topCategories") or [],
+            "totalMentions": block.get("totalMentions"),
+            "categories": block.get("categories") or [],
+        }
+
+    return {
+        "status": "success",
+        "brand": data.get("name"),
+        "topicName": data.get("topicName"),
+        "reportId": data.get("reportId"),
+        "win_rate": {
+            "wins": overall.get("wins"),
+            "losses": overall.get("losses"),
+            "ties": overall.get("ties"),
+            "total": overall.get("total"),
+            "win_percentage": overall.get("winPercentage"),
+        },
+        "by_competitor": wra.get("byCompetitor") or {},
+        "by_model": wra.get("byModel") or {},
+        "strengths": _slim(data.get("strengths")),
+        "weaknesses": _slim(data.get("weaknesses")),
+        "next_step": {
+            "tool": "mint_get_competition_responses",
+            "why": "Pull the actual prompts/responses behind these stats to show examples.",
+        },
+        "metadata": {
+            "domainId": domain_id, "topicId": topic_id,
+            "totalComparisons": md.get("totalComparisons"),
+            "competitorsAnalyzed": md.get("competitorsAnalyzed") or [],
+            "modelsIncluded": md.get("modelsIncluded") or [],
+            "dateRange": {"start": ds, "end": de},
+            "filters": {"models": models or "all", "competitors": competitors or "all"},
+            "note": "Aggregated endpoint defaults to the last 6 months when no dates are given.",
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+# TOOL — mint_get_competition_responses (DETAIL prompts + answers)
+# ══════════════════════════════════════════════════════════════════
+
+async def _tool_get_competition_responses(args: dict) -> dict:
+    """Raw competition results for ONE topic: the prompts and LLM answers behind
+    the head-to-head stats, with winner / reasoning / strengths / weaknesses.
+
+    Wraps GET /competition/raw-results (paginated). Use it to SHOW examples.
+    """
+    domain_id = require_str(args, "domainId")
+    topic_id = require_str(args, "topicId")
+    start_date = optional_str(args, "startDate")
+    end_date = optional_str(args, "endDate")
+    models = optional_str(args, "models")
+    prompt_id = optional_str(args, "promptId")
+    page = optional_int(args, "page", default=1, min_val=1, max_val=10000)
+    limit = optional_int(args, "limit", default=10, min_val=1, max_val=100)
+    winner_filter = optional_enum(args, "winner_filter", {"brand", "competitor", "tie", "all"}, "all")
+    truncate = optional_int(args, "truncate_response", default=0, min_val=0, max_val=20000)
+
+    params: dict[str, Any] = {"page": page, "limit": limit}
+    if start_date:  params["startDate"] = start_date
+    if end_date:    params["endDate"] = end_date
+    if models:      params["models"] = models
+    if prompt_id:   params["promptId"] = prompt_id
+
+    endpoint = f"/domains/{domain_id}/topics/{topic_id}/competition/raw-results"
+    data = await fetch_get(endpoint, params)
+    raw = data.get("results") or []
+
+    def _trim(txt):
+        if truncate and isinstance(txt, str) and len(txt) > truncate:
+            return txt[:truncate] + "…"
+        return txt
+
+    rows = []
+    for r in raw:
+        if winner_filter != "all" and (r.get("winner") or "").lower() != winner_filter:
+            continue
+        rows.append({
+            "id": r.get("id"),
+            "prompt": r.get("prompt"),
+            "response": _trim(r.get("response")),
+            "model": r.get("model"),
+            "brand": r.get("name"),
+            "competitor": r.get("competitor"),
+            "winner": r.get("winner"),
+            "winner_reasoning": r.get("winnerReasoning"),
+            "strengths": r.get("strengths") or [],
+            "weaknesses": r.get("weaknesses") or [],
+            "reportDate": r.get("reportDate"),
+            "reportId": r.get("reportId"),
+        })
+
+    win_counts = Counter((r.get("winner") or "unknown") for r in raw)
+
+    return {
+        "status": "success",
+        "results": rows,
+        "pagination": data.get("pagination") or {"page": page, "limit": limit},
+        "winner_counts_this_page": dict(win_counts),
+        "metadata": {
+            "domainId": domain_id, "topicId": topic_id,
+            "winner_filter": winner_filter,
+            "filters": {"models": models or "all", "promptId": prompt_id,
+                        "startDate": start_date, "endDate": end_date},
+            "note": "winner='brand' = your tracked brand won, 'competitor' = the rival won, "
+                    "'tie' = no clear winner. winner_filter is applied to the current page only "
+                    "(the API paginates before filtering). For aggregated win-rate stats use "
+                    "mint_get_competition_overview.",
+        },
+    }
+
+
 TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
     # (name, description, inputSchema, annotations)
+    #
+    # ROUTING NOTE: the LLM only sees `description` (sent via list_tools), never
+    # these Python comments. Tool selection is steered by the ROUTING MAP in
+    # mint_get_domains_and_topics and by each tool's USE FOR / DON'T USE FOR.
+    # When adding/renaming a tool, update the ROUTING MAP so the LLM can route to it.
 
     (
         "mint_get_domains_and_topics",
@@ -2058,18 +2235,33 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
             "USE FOR: 'What brands/markets do I have?', 'List my topics', 'Show all IBIS markets', "
             "or silently to resolve a brand/market name into IDs before another tool."
             "\n\n"
-            "ROUTING MAP (which source/score tool to use next):\n"
-            "  - Macro snapshot of one topic (score, SoV,\n"
-            "    competitors, mentions, source mix)        -> mint_get_topic_overview\n"
-            "  - One brand's score history over time      -> mint_get_topic_scores\n"
-            "  - Compare many markets/brands in a table    -> mint_get_scores_overview\n"
-            "  - A line chart of visibility over time      -> mint_get_visibility_trend\n"
-            "  - Which sites/URLs are cited (by model/time)-> mint_get_topic_sources\n"
+            "ROUTING MAP - pick the tool from what the user asks:\n"
+            "\n"
+            "  VISIBILITY / SCORES  (am I seen, how high):\n"
+            "  - Overview/dashboard of a topic: score + share of voice + rank\n"
+            "                                               -> mint_get_topic_overview\n"
+            "  - Daily score history, brand vs competitors  -> mint_get_topic_scores\n"
+            "  - Compare many markets/brands (table)        -> mint_get_scores_overview\n"
+            "  - Trend / curve / chart over time            -> mint_get_visibility_trend\n"
+            "  - Which AI models are tracked for a topic    -> mint_get_models_by_topic\n"
+            "\n"
+            "  COMPETITION  (who WINS head-to-head, my brand vs rivals):\n"
+            "  - 'Qui est le meilleur entre X et ses concurrents ?', win rate,\n"
+            "    my strengths/weaknesses, which rival beats me most\n"
+            "                                               -> mint_get_competition_overview\n"
+            "  - Examples where I win/lose, the actual comparison prompts\n"
+            "    and what a model answered                  -> mint_get_competition_responses\n"
+            "\n"
+            "  SOURCES / CITATIONS  (what the LLMs cite, what those pages say):\n"
+            "  - Which sites/URLs are cited (by model/time) -> mint_get_topic_sources\n"
             "  - Who is cited, owned vs external, brand\n"
-            "    mentioned or not (fast, weighted)         -> mint_get_response_sources\n"
-            "  - Which cited PAGES mention my brand /\n"
-            "    rank external sources citing my brand     -> mint_enrich_cited_sources\n"
-            "  - Which AI models exist for a topic         -> mint_get_models_by_topic"
+            "    mentioned or not (fast, weighted)          -> mint_get_response_sources\n"
+            "  - Do the cited PAGES mention my brand /\n"
+            "    rank external sources citing my brand      -> mint_enrich_cited_sources\n"
+            "\n"
+            "  RULE OF THUMB: 'best / win / vs / beat' => COMPETITION ; "
+            "'seen / score / share of voice / rank' => VISIBILITY ; "
+            "'cited / source / URL / page' => SOURCES."
             "\n\n"
             "Returns: domains (id+name), topics (domainId, domainName, topicId, topicName), "
             "a 'Brand > Topic' -> IDs mapping, and any errors."
@@ -2416,6 +2608,82 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
         {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
     ),
 
+    (
+        "mint_get_competition_overview",
+        (
+            "MACRO COMPETITION SNAPSHOT — for ONE topic, how your brand fares HEAD-TO-HEAD "
+            "against its competitors: overall win/loss/tie counts and win percentage, the same "
+            "split by competitor and by AI model, plus the recurring STRENGTHS and WEAKNESSES "
+            "categories the models attribute to your brand. Answers 'who wins between my brand "
+            "and its rivals on this topic, and why'."
+            "\n\n"
+            "USE FOR:\n"
+            "  - 'Qui est le meilleur entre IBIS FR et ses concurrents ?'\n"
+            "  - 'What is my win rate vs competitors on this topic?'\n"
+            "  - 'Which competitor beats me most often?' -> read by_competitor\n"
+            "  - 'My strengths / weaknesses according to the models' -> strengths / weaknesses"
+            "\n\n"
+            "DON'T USE FOR:\n"
+            "  - The individual prompts and LLM answers behind the stats -> mint_get_competition_responses\n"
+            "  - Visibility score vs competitors (not head-to-head)       -> mint_get_topic_scores / mint_get_topic_overview"
+            "\n\n"
+            "GOLDEN RULE: omit startDate/endDate/models/competitors unless the user specified "
+            "them (the aggregated endpoint defaults to the last 6 months)."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "domainId":    {"type": "string", "description": "Domain ID (REQUIRED). From mint_get_domains_and_topics."},
+                "topicId":     {"type": "string", "description": "Topic ID (REQUIRED). From mint_get_domains_and_topics."},
+                "startDate":   {"type": "string", "description": "YYYY-MM-DD. Optional (default: last 6 months)."},
+                "endDate":     {"type": "string", "description": "YYYY-MM-DD. Optional (default: now)."},
+                "models":      {"type": "string", "description": "Comma-separated model filter, NO spaces. Optional (omit for all models)."},
+                "competitors": {"type": "string", "description": "Comma-separated competitor names to restrict the analysis. Optional."},
+            },
+            "required": ["domainId", "topicId"],
+        },
+        {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+    ),
+
+    (
+        "mint_get_competition_responses",
+        (
+            "COMPETITION DETAIL — the actual head-to-head PROMPTS and LLM RESPONSES behind the "
+            "competition stats, for ONE topic. Each row is one comparison: the prompt, the model's "
+            "answer, who won (brand / competitor / tie), the reasoning, and the strengths & "
+            "weaknesses the model gave. Use it to SHOW concrete examples (quotes where your brand "
+            "wins or loses). Same role as the visibility raw-results, for competition."
+            "\n\n"
+            "USE FOR:\n"
+            "  - 'Show examples where IBIS wins / loses vs competitors' -> winner_filter='brand'/'competitor'\n"
+            "  - 'What did GPT-5 actually say comparing us to X?'\n"
+            "  - Drilling into one prompt -> promptId"
+            "\n\n"
+            "DON'T USE FOR aggregated win-rate / strengths stats -> mint_get_competition_overview."
+            "\n\n"
+            "PAGINATION: returns 'limit' rows per page (default 10, max 100); use 'page' to go "
+            "further. 'truncate_response' caps each answer's length to keep payloads small. "
+            "GOLDEN RULE: omit dates/models unless the user specified them."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "domainId":  {"type": "string", "description": "Domain ID (REQUIRED). From mint_get_domains_and_topics."},
+                "topicId":   {"type": "string", "description": "Topic ID (REQUIRED). From mint_get_domains_and_topics."},
+                "startDate": {"type": "string", "description": "YYYY-MM-DD. Optional (default: last 6 months)."},
+                "endDate":   {"type": "string", "description": "YYYY-MM-DD. Optional (default: now)."},
+                "models":    {"type": "string", "description": "Comma-separated model filter, NO spaces. Optional."},
+                "promptId":  {"type": "string", "description": "Restrict to a single prompt ID. Optional."},
+                "winner_filter": {"type": "string", "enum": ["brand", "competitor", "tie", "all"], "description": "Keep only comparisons won by your brand, the competitor, ties, or all. Applied to the current page. Default: 'all'."},
+                "page":      {"type": "integer", "description": "Page number (1-based). Default: 1."},
+                "limit":     {"type": "integer", "description": "Rows per page. Default: 10, max: 100."},
+                "truncate_response": {"type": "integer", "description": "Max characters per LLM response (0 = full text). Default: 0."},
+            },
+            "required": ["domainId", "topicId"],
+        },
+        {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+    ),
+
     # ── mint_get_raw_responses and mint_enrich_sources are intentionally NOT exposed. ──
     # mint_get_raw_responses (the old monolithic tool) is superseded by the pair
     # mint_get_response_sources (fast) + mint_enrich_cited_sources (deep). Its handler
@@ -2440,6 +2708,8 @@ _TOOL_HANDLERS: dict[str, Any] = {
     # v5 source tools (split from the old monolithic raw_responses)
     "mint_get_response_sources":   _tool_get_response_sources,
     "mint_enrich_cited_sources":   _tool_enrich_cited_sources,
+    "mint_get_competition_overview":  _tool_get_competition_overview,
+    "mint_get_competition_responses": _tool_get_competition_responses,
     # superseded / unlisted but kept callable for backward compatibility
     "mint_get_raw_responses":      _tool_get_raw_responses,
     "mint_enrich_sources":         _tool_enrich_sources,
