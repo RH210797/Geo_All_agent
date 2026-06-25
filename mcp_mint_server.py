@@ -96,7 +96,7 @@ COMPAT — SSE transport preserved (Render + Claude.ai compatible).
          No breaking change on wire protocol or deploy process.
 ═══════════════════════════════════════════════════════════════════
 
-Tools (11 exposed):
+Tools (13 exposed):
   mint_get_domains_and_topics  — catalog discovery
   mint_get_models_by_topic     — list AI models for one topic
   mint_get_topic_overview      — v5.1: one-call MACRO snapshot (score, SoV, competitors, source mix)
@@ -108,6 +108,8 @@ Tools (11 exposed):
   mint_enrich_cited_sources    — v5: DEEP page enrichment, ranks sources citing your brand
   mint_get_competition_overview  - v5.3: MACRO head-to-head win rate, strengths, weaknesses
   mint_get_competition_responses - v5.3: DETAIL competition prompts + LLM answers (examples)
+  mint_resolve_scope             - v5.4: fuzzy brand/market -> IDs (QCM clarification if ambiguous)
+  mint_refine_query              - v5.5: guided narrowing of a broad question (brand/period/model QCM)
 
 Unlisted but callable (backward compat): mint_get_raw_responses, mint_enrich_sources
 
@@ -176,7 +178,7 @@ _HTTP_SEMAPHORE = asyncio.Semaphore(HTTP_MAX_CONCURRENT)
 _RATE_LOCK = asyncio.Lock()
 _last_request_ts: float = 0.0
 
-__version__ = "5.3.0"
+__version__ = "5.5.0"
 
 server = Server("mint_visibility_mcp")
 
@@ -375,6 +377,37 @@ def optional_enum(args: dict, key: str, allowed: set, default: str) -> str:
     if val not in allowed:
         raise InvalidInput(f"'{key}' must be one of {sorted(allowed)}, got '{val}'.")
     return val
+
+
+# ══════════════════════════════════════════════════════════════════
+# CLARIFICATION (QCM) — portable convention, no special client support
+# ══════════════════════════════════════════════════════════════════
+
+def clarification(question: str, options: list, *, param: str, multi: bool = False) -> dict:
+    """Build a standard 'ask the user a multiple-choice question' (QCM) payload.
+
+    ANY tool can return this when the request is ambiguous. The assistant/LLM is
+    expected to render `clarification.options` as a multiple-choice question, then
+    re-call the SAME tool with the user's pick placed in the argument named by
+    `clarification.param`. Portable: needs no special MCP client support.
+    """
+    norm = []
+    for o in options:
+        if isinstance(o, dict):
+            norm.append({"label": o.get("label"),
+                         "value": o.get("value", o.get("label")),
+                         "description": o.get("description")})
+        else:
+            norm.append({"label": str(o), "value": str(o), "description": None})
+    return {
+        "status": "needs_clarification",
+        "clarification": {"question": question, "param": param,
+                          "multiSelect": multi, "options": norm},
+        "assistant_instructions": (
+            "Do NOT guess and do NOT call another tool yet. Ask the user this as a "
+            "multiple-choice question (show each option label). When they answer, call "
+            "the SAME tool again with their choice in the '" + param + "' argument."),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -2216,6 +2249,154 @@ async def _tool_get_competition_responses(args: dict) -> dict:
     }
 
 
+# ══════════════════════════════════════════════════════════════════
+# TOOL — mint_resolve_scope (disambiguate brand/market -> IDs, QCM)
+# ══════════════════════════════════════════════════════════════════
+
+async def _tool_resolve_scope(args: dict) -> dict:
+    """Turn a fuzzy brand / market hint into a concrete domainId + topicId.
+
+    Returns a `needs_clarification` QCM when the hint matches several markets
+    (e.g. 'IBIS' -> FR/UK/AU/BR/DE) or none. Once status='resolved', pass the
+    returned domainId/topicId to the analysis tools.
+    """
+    brand = optional_str(args, "brand")
+    market = optional_str(args, "market")
+
+    catalog = await _tool_get_domains_and_topics({})
+    topics = filter_topics(catalog["topics"], None, brand, market)
+
+    if len(topics) == 1:
+        t = topics[0]
+        return {"status": "resolved",
+                "domainId": t["domainId"], "topicId": t["topicId"],
+                "brand": t["domainName"], "market": t["topicName"]}
+
+    if not topics:
+        brands = sorted({t["domainName"] for t in catalog["topics"]})
+        return clarification(
+            f"No market matches brand={brand!r}, market={market!r}. Which brand?",
+            [{"label": b, "value": b} for b in brands], param="brand")
+
+    brands_in = sorted({t["domainName"] for t in topics})
+    if len(brands_in) == 1:
+        opts = [{"label": t["topicName"], "value": t["topicName"],
+                 "description": f"{t['domainName']} > {t['topicName']}"} for t in topics]
+        return clarification(f"{brands_in[0]} has {len(topics)} markets. Which one?",
+                             opts, param="market")
+
+    opts = [{"label": f"{t['domainName']} > {t['topicName']}", "value": t["topicName"],
+             "description": f"domainId={t['domainId']} topicId={t['topicId']}"} for t in topics]
+    return clarification("Several brand/market pairs match. Which one?", opts, param="market")
+
+
+# ══════════════════════════════════════════════════════════════════
+# TOOL — mint_refine_query (guided narrowing via QCM refinements)
+# ══════════════════════════════════════════════════════════════════
+
+async def _tool_refine_query(args: dict) -> dict:
+    """Guide a BROAD analytical question into a precise scope, via QCM steps.
+
+    For open questions ('which source is most cited in France?') it first offers
+    OPTIONAL refinement dimensions (brand / market / period / model) as a
+    multi-select QCM, then collects each chosen value with a QCM, and finally
+    returns status='ready' with concrete filters to pass to the analysis tools.
+    Re-call this SAME tool with the user's pick in the argument named by
+    `clarification.param` until it returns status='ready'.
+    """
+    question = optional_str(args, "question")
+    dims = optional_str_list(args, "dimensions")
+    brand = optional_str(args, "brand")
+    market = optional_str(args, "market")
+    period = optional_str(args, "period")
+    models = optional_str(args, "models")
+
+    DIM_OPTS = [
+        {"label": "Une marque",          "value": "brand",  "description": "Restreindre à une marque (IBIS, Novotel, ...)."},
+        {"label": "Un pays / marché",    "value": "market", "description": "Restreindre à un marché (FR, UK, ...)."},
+        {"label": "Une période",         "value": "period", "description": "Restreindre à une fenêtre temporelle."},
+        {"label": "Un modèle d'IA",      "value": "model",  "description": "Restreindre à un modèle LLM précis."},
+        {"label": "Non — vue globale",   "value": "none",   "description": "Pas de filtre, analyse globale."},
+    ]
+
+    # Phase 1 — offer the refinement dimensions (multi-select)
+    if dims is None:
+        q = "Souhaitez-vous affiner l'analyse ? (choix multiple possible)"
+        if question:
+            q = f"« {question} » — " + q
+        return clarification(q, DIM_OPTS, param="dimensions", multi=True)
+
+    chosen = {d.lower() for d in dims}
+    if "none" in chosen:
+        chosen = set()
+    if "model" in chosen:
+        chosen |= {"brand", "market"}   # a model needs a resolved topic
+
+    catalog = await _tool_get_domains_and_topics({})
+
+    # Phase 2 — collect a value for each chosen dimension still missing
+    if "brand" in chosen and not brand:
+        brands = sorted({t["domainName"] for t in catalog["topics"]})
+        return clarification("Quelle marque ?",
+                             [{"label": b, "value": b} for b in brands], param="brand")
+
+    if "market" in chosen and not market:
+        pool = [t for t in catalog["topics"]
+                if (not brand) or brand.upper() in (t["domainName"] or "").upper()]
+        markets = sorted({t["topicName"] for t in pool})
+        return clarification("Quel marché ?",
+                             [{"label": m, "value": m} for m in markets], param="market")
+
+    if "period" in chosen and not period:
+        return clarification("Quelle période ?", [
+            {"label": "7 derniers jours",        "value": "7d"},
+            {"label": "30 derniers jours",       "value": "30d"},
+            {"label": "Ce mois-ci",              "value": "month"},
+            {"label": "3 derniers mois",         "value": "90d"},
+            {"label": "6 derniers mois (max)",   "value": "180d"},
+        ], param="period")
+
+    if "model" in chosen and not models:
+        ts = filter_topics(catalog["topics"], None, brand, market)
+        if len(ts) == 1:
+            md = await _tool_get_models_by_topic(
+                {"domainId": ts[0]["domainId"], "topicId": ts[0]["topicId"]})
+            opts = [{"label": m, "value": m} for m in (md.get("models") or [])]
+            if opts:
+                return clarification("Quel modèle d'IA ?", opts, param="models")
+
+    # Phase 3 — ready: compute concrete filters
+    start = end = None
+    if period:
+        today = date.today()
+        if period == "month":
+            start, end = today.strftime("%Y-%m-01"), today.strftime("%Y-%m-%d")
+        else:
+            days = {"7d": 7, "30d": 30, "90d": 90, "180d": 180}.get(period, 30)
+            start, end = default_date_range(days)
+
+    ids = {}
+    pinned = filter_topics(catalog["topics"], None, brand, market)
+    if len(pinned) == 1:
+        ids = {"domainId": pinned[0]["domainId"], "topicId": pinned[0]["topicId"]}
+
+    return {
+        "status": "ready",
+        "filters": {
+            "brand_filter": brand, "market_filter": market,
+            "startDate": start, "endDate": end, "models": models,
+            **ids,
+        },
+        "assistant_instructions": (
+            "Scope confirmed. Call the appropriate analysis tool with these filters: "
+            "'most cited source' -> mint_get_response_sources / mint_get_topic_sources ; "
+            "'win rate / strengths / weaknesses' -> mint_get_competition_overview ; "
+            "'visibility score' -> mint_get_topic_overview. Pass brand_filter/market_filter "
+            "(and startDate/endDate/models) where the tool accepts them, or domainId/topicId "
+            "when provided."),
+    }
+
+
 TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
     # (name, description, inputSchema, annotations)
     #
@@ -2246,8 +2427,9 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
             "  - Which AI models are tracked for a topic    -> mint_get_models_by_topic\n"
             "\n"
             "  COMPETITION  (who WINS head-to-head, my brand vs rivals):\n"
-            "  - 'Qui est le meilleur entre X et ses concurrents ?', win rate,\n"
-            "    my strengths/weaknesses, which rival beats me most\n"
+            "  - 'Qui est le meilleur entre X et ses concurrents ?', 'mes forces et\n"
+            "    faiblesses', 'points forts/faibles', win rate, strengths/weaknesses,\n"
+            "    which competitor beats me most\n"
             "                                               -> mint_get_competition_overview\n"
             "  - Examples where I win/lose, the actual comparison prompts\n"
             "    and what a model answered                  -> mint_get_competition_responses\n"
@@ -2261,7 +2443,13 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
             "\n"
             "  RULE OF THUMB: 'best / win / vs / beat' => COMPETITION ; "
             "'seen / score / share of voice / rank' => VISIBILITY ; "
-            "'cited / source / URL / page' => SOURCES."
+            "'cited / source / URL / page' => SOURCES.\n"
+            "  - Fuzzy brand/market ('IBIS', unclear which market) => mint_resolve_scope\n"
+            "  - BROAD question, offer to narrow (brand/period/model) => mint_refine_query"
+            "\n\n"
+            "CLARIFICATION CONVENTION: any tool may return status='needs_clarification' with "
+            "`clarification.options`. Present them to the user as a multiple-choice question "
+            "and re-call the tool with the chosen value in `clarification.param`. Never guess."
             "\n\n"
             "Returns: domains (id+name), topics (domainId, domainName, topicId, topicName), "
             "a 'Brand > Topic' -> IDs mapping, and any errors."
@@ -2306,7 +2494,10 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
         (
             "SCORE HISTORY FOR ONE TOPIC — day-by-day visibility scores of your brand vs its "
             "competitors, for a single topic (one brand in one market), broken down by AI model. "
-            "This is the detailed single-topic view: each day, each entity, each model."
+            "This is the detailed single-topic view: each day, each entity, each model. "
+            "These are VISIBILITY scores (how often / how high each brand shows up), "
+            "NOT a head-to-head verdict: for win rate, strengths or weaknesses use "
+            "mint_get_competition_overview."
             "\n\n"
             "USE FOR: 'How did IBIS FR score vs competitors last month?', "
             "'Show the daily score curve for Novotel UK', "
@@ -2315,7 +2506,8 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
             "DON'T USE FOR (pick the right tool instead):\n"
             "  - Several topics/markets at once, as a table -> mint_get_scores_overview\n"
             "  - A ready-to-plot time-series line chart     -> mint_get_visibility_trend\n"
-            "  - Anything about CITED SOURCES/URLs          -> mint_get_topic_sources or mint_get_raw_responses"
+            "  - Anything about CITED SOURCES/URLs          -> mint_get_topic_sources or mint_get_raw_responses\n"
+            "  - Strengths / weaknesses, win rate, who beats whom -> mint_get_competition_overview"
             "\n\n"
             "GOLDEN RULE: if the user does NOT mention specific dates or a model, OMIT those "
             "params (defaults: last 30 days, all models). Only pass 'models' once the user asks "
@@ -2466,6 +2658,7 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
             "  - Full top cited domains & URLs (and over time)   -> mint_get_topic_sources\n"
             "  - A ready-to-plot chart                           -> mint_get_visibility_trend\n"
             "  - Owned/external + page brand analysis            -> mint_get_response_sources / mint_enrich_cited_sources\n"
+            "  - Strengths / weaknesses, or who WINS vs rivals   -> mint_get_competition_overview\n"
             "  - Compare MANY topics in a table                  -> mint_get_scores_overview"
             "\n\n"
             "GOLDEN RULE: omit startDate/endDate/models unless the user specified them "
@@ -2611,6 +2804,10 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
     (
         "mint_get_competition_overview",
         (
+            "TRIGGERS (use this tool when the user asks any of): 'forces et faiblesses', "
+            "'mes points forts / points faibles', 'qui est le meilleur entre X et ses "
+            "concurrents', 'vs concurrents', 'qui gagne', win rate, strengths, weaknesses, "
+            "who beats me.\n\n"
             "MACRO COMPETITION SNAPSHOT — for ONE topic, how your brand fares HEAD-TO-HEAD "
             "against its competitors: overall win/loss/tie counts and win percentage, the same "
             "split by competitor and by AI model, plus the recurring STRENGTHS and WEAKNESSES "
@@ -2648,6 +2845,9 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
     (
         "mint_get_competition_responses",
         (
+            "TRIGGERS: 'montre des exemples', 'des cas où je gagne / je perds', "
+            "'qu'a répondu le modèle en nous comparant', concrete competition examples, "
+            "quotes from the comparison answers.\n\n"
             "COMPETITION DETAIL — the actual head-to-head PROMPTS and LLM RESPONSES behind the "
             "competition stats, for ONE topic. Each row is one comparison: the prompt, the model's "
             "answer, who won (brand / competitor / tie), the reasoning, and the strengths & "
@@ -2684,6 +2884,59 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
         {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
     ),
 
+    (
+        "mint_resolve_scope",
+        (
+            "RESOLVE A FUZZY BRAND/MARKET HINT into a concrete domainId + topicId. Call this "
+            "when the user names a brand or market loosely (e.g. 'IBIS', 'compare IBIS', "
+            "'forces/faiblesses d'IBIS') and you are NOT sure which exact market they mean.\n\n"
+            "If the hint matches several markets (IBIS -> FR/UK/AU/BR/DE) or none, it returns a "
+            "`needs_clarification` QCM: present `clarification.options` to the user as a "
+            "multiple-choice question, then call this tool AGAIN with their choice in the "
+            "argument named by `clarification.param`. When it returns status='resolved', use the "
+            "domainId/topicId with the analysis tools. Never guess the market yourself."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "brand":  {"type": "string", "description": "Brand name hint (e.g. 'IBIS', 'Novotel'). Optional."},
+                "market": {"type": "string", "description": "Market keyword hint (e.g. 'FR', 'UK'). Optional."},
+            },
+            "required": [],
+        },
+        {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+    ),
+
+    (
+        "mint_refine_query",
+        (
+            "GUIDED NARROWING for a BROAD question — when the user asks something open "
+            "('quelle source est la plus citée en France ?', 'mes forces et faiblesses ?') and "
+            "useful filters (brand, market, period, model) are missing, call this FIRST. It "
+            "offers the relevant refinements as a multi-select QCM, collects each chosen value "
+            "with a QCM, and finally returns status='ready' with concrete filters.\n\n"
+            "FLOW: call with just `question` -> it returns a `needs_clarification` QCM "
+            "(param='dimensions', multiSelect). Present it, then re-call with the chosen "
+            "`dimensions`; keep re-calling with the value asked in `clarification.param` "
+            "(brand, market, period, models) until status='ready', then run the analysis tool "
+            "with the returned `filters`. The user can pick 'Non — vue globale' to skip filters.\n\n"
+            "USE FOR: turning a vague analytics question into a precise scope without guessing."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "question":   {"type": "string", "description": "The user's original question (for context). Optional."},
+                "dimensions": {"type": "array", "items": {"type": "string"}, "description": "Chosen refinement dimensions: any of 'brand','market','period','model','none'. Omit on the first call."},
+                "brand":      {"type": "string", "description": "Chosen brand value (filled from a QCM answer)."},
+                "market":     {"type": "string", "description": "Chosen market value (filled from a QCM answer)."},
+                "period":     {"type": "string", "description": "Chosen period preset: '7d','30d','month','90d','180d'."},
+                "models":     {"type": "string", "description": "Chosen model name (filled from a QCM answer)."},
+            },
+            "required": [],
+        },
+        {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+    ),
+
     # ── mint_get_raw_responses and mint_enrich_sources are intentionally NOT exposed. ──
     # mint_get_raw_responses (the old monolithic tool) is superseded by the pair
     # mint_get_response_sources (fast) + mint_enrich_cited_sources (deep). Its handler
@@ -2710,6 +2963,8 @@ _TOOL_HANDLERS: dict[str, Any] = {
     "mint_enrich_cited_sources":   _tool_enrich_cited_sources,
     "mint_get_competition_overview":  _tool_get_competition_overview,
     "mint_get_competition_responses": _tool_get_competition_responses,
+    "mint_resolve_scope":            _tool_resolve_scope,
+    "mint_refine_query":             _tool_refine_query,
     # superseded / unlisted but kept callable for backward compatibility
     "mint_get_raw_responses":      _tool_get_raw_responses,
     "mint_enrich_sources":         _tool_enrich_sources,
