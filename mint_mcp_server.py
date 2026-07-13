@@ -1,5 +1,20 @@
 """
-Mint.ai Visibility MCP Server — v5.6.0 (Raw data export tool)
+Mint.ai Visibility MCP Server — v5.7.0 (Slimmer toolset)
+═══════════════════════════════════════════════════════════════════
+WHAT'S NEW IN v5.7.0
+═══════════════════════════════════════════════════════════════════
+REMOVED - mint_refine_query: the guided-narrowing meta-tool is dropped. The LLM
+          narrows a broad request by simply asking the user, and
+          mint_resolve_scope already disambiguates a fuzzy brand/market. It was
+          an extra hop with no data of its own.
+REMOVED - mint_get_visibility_trend: dropped as redundant. Multi-topic / period
+          comparison is covered by mint_get_scores_overview (snapshot table);
+          when a real time-series is needed, mint_get_topic_scores already
+          returns the day-by-day dataset a client can chart.
+DOCS    - Tool descriptions AND this README refreshed for the 12-tool set. All
+          references to the two removed tools were purged from the ROUTING MAP
+          and from every per-tool DON'T USE FOR section, so the LLM never routes
+          to a tool that no longer exists.
 ═══════════════════════════════════════════════════════════════════
 WHAT'S NEW IN v5.6.0
 ═══════════════════════════════════════════════════════════════════
@@ -101,22 +116,21 @@ CLEAN  — Consistent English logging (production-friendly).
 COMPAT — SSE transport preserved (Render + Claude.ai compatible).
          No breaking change on wire protocol or deploy process.
 ═══════════════════════════════════════════════════════════════════
-Tools (14 exposed):
-  mint_get_domains_and_topics  — catalog discovery
-  mint_get_models_by_topic     — list AI models for one topic
-  mint_get_topic_overview      — v5.1: one-call MACRO snapshot (score, SoV, competitors, source mix)
-  mint_get_topic_scores        — Brand vs Competitors, 1 topic, per-model
-  mint_get_scores_overview     — multi-topic summary table
-  mint_get_visibility_trend    — time series for charts
-  mint_get_topic_sources       — top cited domains/URLs, 1 topic
-  mint_get_response_sources    — v5: FAST cited-source overview, weighted, no enrichment
-  mint_enrich_cited_sources    — v5: DEEP page enrichment, ranks sources citing your brand
-  mint_get_raw_prompts         — v5.6: RAW export, 1 row per cited source (prompt | source | topic | brand | top_of_mind)
-  mint_get_competition_overview  - v5.3: MACRO head-to-head win rate, strengths, weaknesses
-  mint_get_competition_responses - v5.3: DETAIL competition prompts + LLM answers (examples)
-  mint_resolve_scope             - v5.4: fuzzy brand/market -> IDs (QCM clarification if ambiguous)
-  mint_refine_query              - v5.5: guided narrowing of a broad question (brand/period/model QCM)
+Tools (12 exposed):
+  mint_get_domains_and_topics    — catalog discovery + ROUTING MAP (always start here)
+  mint_resolve_scope             — fuzzy brand/market -> IDs (QCM clarification if ambiguous)
+  mint_get_models_by_topic       — list AI models for one topic
+  mint_get_topic_overview        — one-call MACRO snapshot (score, SoV, competitors, source mix)
+  mint_get_topic_scores          — Brand vs Competitors, 1 topic, per-model, day-by-day dataset
+  mint_get_scores_overview       — multi-topic / multi-market comparison table (avg score each)
+  mint_get_topic_sources         — top cited domains/URLs, 1 topic, per model + over time
+  mint_get_response_sources      — FAST cited-source overview, citation-weighted, no enrichment
+  mint_enrich_cited_sources      — DEEP page enrichment, ranks external sources citing your brand
+  mint_get_raw_prompts           — RAW export, 1 row per cited source (prompt | source | topic | brand | top_of_mind)
+  mint_get_competition_overview  — MACRO head-to-head win rate, strengths, weaknesses
+  mint_get_competition_responses — DETAIL competition prompts + LLM answers (examples)
 Unlisted but callable (backward compat): mint_get_raw_responses, mint_enrich_sources
+Removed in v5.7.0: mint_refine_query, mint_get_visibility_trend
 Environment variables:
   MINT_API_KEY         — API key (REQUIRED)
   MINT_BASE_URL        — Base URL (default: https://api.getmint.ai/api)
@@ -170,7 +184,7 @@ if not MINT_API_KEY:
 _HTTP_SEMAPHORE = asyncio.Semaphore(HTTP_MAX_CONCURRENT)
 _RATE_LOCK = asyncio.Lock()
 _last_request_ts: float = 0.0
-__version__ = "5.6.0"
+__version__ = "5.7.0"
 server = Server("mint_visibility_mcp")
 # ══════════════════════════════════════════════════════════════════
 # PERSISTENT HTTP CLIENT (connection pooling + TLS reuse)
@@ -258,16 +272,6 @@ def default_date_range(days: int) -> tuple[str, str]:
     end = date.today()
     start = end - timedelta(days=days)
     return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
-def week_start(iso_date: str) -> str:
-    """Return the Monday of the week containing iso_date."""
-    d = datetime.fromisoformat(iso_date[:10]).date()
-    return (d - timedelta(days=d.weekday())).strftime("%Y-%m-%d")
-def month_start(iso_date: str) -> str:
-    """Return the first day of the month of iso_date."""
-    return datetime.fromisoformat(iso_date[:10]).date().strftime("%Y-%m-01")
-def day_iso(iso_date: str) -> str:
-    return iso_date[:10]
-BIN_FUNCTIONS = {"day": day_iso, "week": week_start, "month": month_start}
 # ══════════════════════════════════════════════════════════════════
 # INPUT VALIDATION HELPERS
 # ══════════════════════════════════════════════════════════════════
@@ -683,85 +687,7 @@ async def _tool_get_scores_overview(args: dict) -> dict:
         },
     }
 # ══════════════════════════════════════════════════════════════════
-# TOOL 4/7 — mint_get_visibility_trend
-# ══════════════════════════════════════════════════════════════════
-async def _tool_get_visibility_trend(args: dict) -> dict:
-    """Binned time series of visibility scores (day/week/month) for charts."""
-    brand_filter = optional_str(args, "brand_filter")
-    market_filter = optional_str(args, "market_filter")
-    topic_ids = optional_str_list(args, "topic_ids")
-    start_date = optional_str(args, "startDate")
-    end_date = optional_str(args, "endDate")
-    models = optional_str(args, "models")
-    granularity = optional_enum(args, "granularity", {"day", "week", "month"}, "week")
-    aggregation = optional_enum(args, "aggregation", {"average", "per_topic"}, "average")
-    if not start_date or not end_date:
-        end_date = date.today().strftime("%Y-%m-%d")
-        start_date = date(date.today().year, 1, 1).strftime("%Y-%m-%d")
-    catalog = await _tool_get_domains_and_topics({})
-    topics = filter_topics(catalog["topics"], topic_ids, brand_filter, market_filter)
-    if not topics:
-        return {
-            "status": "error",
-            "message": f"No topics found (brand='{brand_filter}', market='{market_filter}'). "
-                       "Use mint_get_domains_and_topics to list available brands and markets.",
-        }
-    params: dict[str, Any] = {"limit": 1000, "startDate": start_date, "endDate": end_date}
-    if models:
-        params["models"] = models
-    async def fetch_topic_points(t):
-        try:
-            d = await fetch_get(
-                f"/domains/{t['domainId']}/topics/{t['topicId']}/visibility", params,
-            )
-            pts = []
-            for r in d.get("reports", []):
-                s = r.get("averageScore")
-                when = r.get("date") or r.get("createdAt") or r.get("reportDate")
-                if s is not None and when:
-                    pts.append({"date": when[:10], "score": float(s)})
-            return t, pts
-        except Exception as e:
-            logger.warning("Trend fetch failed for topic %s: %s", t.get("topicName"), e)
-            return t, []
-    results = await asyncio.gather(*[fetch_topic_points(t) for t in topics])
-    bin_fn = BIN_FUNCTIONS[granularity]
-    if aggregation == "per_topic":
-        series = []
-        for t, pts in results:
-            if not pts:
-                continue
-            buckets: dict[str, list] = defaultdict(list)
-            for p in pts:
-                buckets[bin_fn(p["date"])].append(p["score"])
-            points = [
-                {"date": k, "score": round(sum(v) / len(v), 1), "n": len(v)}
-                for k, v in sorted(buckets.items())
-            ]
-            series.append({"name": f"{t['domainName']} > {t['topicName']}", "points": points})
-    else:
-        buckets_avg: dict[str, list] = defaultdict(list)
-        for _, pts in results:
-            for p in pts:
-                buckets_avg[bin_fn(p["date"])].append(p["score"])
-        points = [
-            {"date": k, "score": round(sum(v) / len(v), 1), "n": len(v)}
-            for k, v in sorted(buckets_avg.items())
-        ]
-        label = f"{brand_filter or 'All'}{' / ' + market_filter if market_filter else ''} ({granularity} avg)"
-        series = [{"name": label, "points": points}]
-    return {
-        "status": "success",
-        "series": series,
-        "metadata": {
-            "granularity": granularity, "aggregation": aggregation,
-            "startDate": start_date, "endDate": end_date,
-            "topics_n": len(topics), "models": models or "all",
-        },
-        "chart_hint": "line",
-    }
-# ══════════════════════════════════════════════════════════════════
-# TOOL 5/7 — mint_get_topic_sources
+# TOOL — mint_get_topic_sources
 # ══════════════════════════════════════════════════════════════════
 async def _tool_get_topic_sources(args: dict) -> dict:
     """Top cited domains and URLs for ONE topic, per AI model."""
@@ -1266,8 +1192,7 @@ async def _tool_get_topic_overview(args: dict) -> dict:
         "top_mentions": (data.get("topMentions") or [])[:top_n],
         "next_step": {
             "for_top_domains_and_urls": "mint_get_topic_sources",
-            "for_score_time_series": "mint_get_topic_scores",
-            "for_a_chart": "mint_get_visibility_trend",
+            "for_score_time_series_or_chart": "mint_get_topic_scores",
             "for_source_brand_analysis": "mint_get_response_sources / mint_enrich_cited_sources",
         },
         "metadata": {
@@ -2173,99 +2098,6 @@ async def _tool_resolve_scope(args: dict) -> dict:
              "description": f"domainId={t['domainId']} topicId={t['topicId']}"} for t in topics]
     return clarification("Several brand/market pairs match. Which one?", opts, param="market")
 # ══════════════════════════════════════════════════════════════════
-# TOOL — mint_refine_query (guided narrowing via QCM refinements)
-# ══════════════════════════════════════════════════════════════════
-async def _tool_refine_query(args: dict) -> dict:
-    """Guide a BROAD analytical question into a precise scope, via QCM steps.
-    For open questions ('which source is most cited in France?') it first offers
-    OPTIONAL refinement dimensions (brand / market / period / model) as a
-    multi-select QCM, then collects each chosen value with a QCM, and finally
-    returns status='ready' with concrete filters to pass to the analysis tools.
-    Re-call this SAME tool with the user's pick in the argument named by
-    `clarification.param` until it returns status='ready'.
-    """
-    question = optional_str(args, "question")
-    dims = optional_str_list(args, "dimensions")
-    brand = optional_str(args, "brand")
-    market = optional_str(args, "market")
-    period = optional_str(args, "period")
-    models = optional_str(args, "models")
-    DIM_OPTS = [
-        {"label": "Une marque",          "value": "brand",  "description": "Restreindre à une marque (IBIS, Novotel, ...)."},
-        {"label": "Un pays / marché",    "value": "market", "description": "Restreindre à un marché (FR, UK, ...)."},
-        {"label": "Une période",         "value": "period", "description": "Restreindre à une fenêtre temporelle."},
-        {"label": "Un modèle d'IA",      "value": "model",  "description": "Restreindre à un modèle LLM précis."},
-        {"label": "Non — vue globale",   "value": "none",   "description": "Pas de filtre, analyse globale."},
-    ]
-    # Phase 1 — offer the refinement dimensions (multi-select)
-    if dims is None:
-        q = "Souhaitez-vous affiner l'analyse ? (choix multiple possible)"
-        if question:
-            q = f"« {question} » — " + q
-        return clarification(q, DIM_OPTS, param="dimensions", multi=True)
-    chosen = {d.lower() for d in dims}
-    if "none" in chosen:
-        chosen = set()
-    if "model" in chosen:
-        chosen |= {"brand", "market"}   # a model needs a resolved topic
-    catalog = await _tool_get_domains_and_topics({})
-    # Phase 2 — collect a value for each chosen dimension still missing
-    if "brand" in chosen and not brand:
-        brands = sorted({t["domainName"] for t in catalog["topics"]})
-        return clarification("Quelle marque ?",
-                             [{"label": b, "value": b} for b in brands], param="brand")
-    if "market" in chosen and not market:
-        pool = [t for t in catalog["topics"]
-                if (not brand) or brand.upper() in (t["domainName"] or "").upper()]
-        markets = sorted({t["topicName"] for t in pool})
-        return clarification("Quel marché ?",
-                             [{"label": m, "value": m} for m in markets], param="market")
-    if "period" in chosen and not period:
-        return clarification("Quelle période ?", [
-            {"label": "7 derniers jours",        "value": "7d"},
-            {"label": "30 derniers jours",       "value": "30d"},
-            {"label": "Ce mois-ci",              "value": "month"},
-            {"label": "3 derniers mois",         "value": "90d"},
-            {"label": "6 derniers mois (max)",   "value": "180d"},
-        ], param="period")
-    if "model" in chosen and not models:
-        ts = filter_topics(catalog["topics"], None, brand, market)
-        if len(ts) == 1:
-            md = await _tool_get_models_by_topic(
-                {"domainId": ts[0]["domainId"], "topicId": ts[0]["topicId"]})
-            opts = [{"label": m, "value": m} for m in (md.get("models") or [])]
-            if opts:
-                return clarification("Quel modèle d'IA ?", opts, param="models")
-    # Phase 3 — ready: compute concrete filters
-    start = end = None
-    if period:
-        today = date.today()
-        if period == "month":
-            start, end = today.strftime("%Y-%m-01"), today.strftime("%Y-%m-%d")
-        else:
-            days = {"7d": 7, "30d": 30, "90d": 90, "180d": 180}.get(period, 30)
-            start, end = default_date_range(days)
-    ids = {}
-    pinned = filter_topics(catalog["topics"], None, brand, market)
-    if len(pinned) == 1:
-        ids = {"domainId": pinned[0]["domainId"], "topicId": pinned[0]["topicId"]}
-    return {
-        "status": "ready",
-        "filters": {
-            "brand_filter": brand, "market_filter": market,
-            "startDate": start, "endDate": end, "models": models,
-            **ids,
-        },
-        "assistant_instructions": (
-            "Scope confirmed. Call the appropriate analysis tool with these filters: "
-            "'most cited source' -> mint_get_response_sources / mint_get_topic_sources ; "
-            "'raw export of prompts + sources' -> mint_get_raw_prompts ; "
-            "'win rate / strengths / weaknesses' -> mint_get_competition_overview ; "
-            "'visibility score' -> mint_get_topic_overview. Pass brand_filter/market_filter "
-            "(and startDate/endDate/models) where the tool accepts them, or domainId/topicId "
-            "when provided."),
-    }
-# ══════════════════════════════════════════════════════════════════
 # MCP TOOL DECLARATIONS
 # ══════════════════════════════════════════════════════════════════
 TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
@@ -2293,7 +2125,8 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
             "                                               -> mint_get_topic_overview\n"
             "  - Daily score history, brand vs competitors  -> mint_get_topic_scores\n"
             "  - Compare many markets/brands (table)        -> mint_get_scores_overview\n"
-            "  - Trend / curve / chart over time            -> mint_get_visibility_trend\n"
+            "  - Score evolution / curve over time (chart it\n"
+            "    from the day-by-day dataset)               -> mint_get_topic_scores\n"
             "  - Which AI models are tracked for a topic    -> mint_get_models_by_topic\n"
             "\n"
             "  COMPETITION  (who WINS head-to-head, my brand vs rivals):\n"
@@ -2321,7 +2154,8 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
             "'cited / source / URL / page' => SOURCES ; "
             "'raw / export / every prompt / prompt-by-prompt / dump' => mint_get_raw_prompts.\n"
             "  - Fuzzy brand/market ('IBIS', unclear which market) => mint_resolve_scope\n"
-            "  - BROAD question, offer to narrow (brand/period/model) => mint_refine_query"
+            "  - BROAD/vague question with missing filters => don't guess: ask the user "
+            "which brand/market/period they mean, then route to the tool above."
             "\n\n"
             "CLARIFICATION CONVENTION: any tool may return status='needs_clarification' with "
             "`clarification.options`. Present them to the user as a multiple-choice question "
@@ -2339,8 +2173,8 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
             "LIST AI MODELS FOR ONE TOPIC. Returns the exact model names available for a "
             "given topic (each topic can have a different set), resolved live from the API. "
             "These names are what you pass to the 'models' parameter of mint_get_topic_scores, "
-            "mint_get_topic_sources, mint_get_scores_overview, mint_get_visibility_trend or "
-            "mint_get_raw_responses."
+            "mint_get_topic_sources, mint_get_scores_overview, mint_get_response_sources or "
+            "mint_get_raw_prompts."
             "\n\n"
             "USE FOR: 'Which models are tracked for IBIS FR?', or right after the user accepts "
             "a per-model deep dive, to get valid model names before filtering."
@@ -2375,11 +2209,12 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
             "\n\n"
             "USE FOR: 'How did IBIS FR score vs competitors last month?', "
             "'Show the daily score curve for Novotel UK', "
-            "'Compare GPT-5.1 vs Sonar Pro scores on one topic'."
+            "'Compare GPT-5.1 vs Sonar Pro scores on one topic', and ANY 'trend / curve / "
+            "chart over time' request — the returned 'dataset' is one row per (Date, Entity, "
+            "Model), which a client can plot directly as a line chart."
             "\n\n"
             "DON'T USE FOR (pick the right tool instead):\n"
             "  - Several topics/markets at once, as a table -> mint_get_scores_overview\n"
-            "  - A ready-to-plot time-series line chart     -> mint_get_visibility_trend\n"
             "  - Anything about CITED SOURCES/URLs          -> mint_get_topic_sources or mint_get_response_sources\n"
             "  - Strengths / weaknesses, win rate, who beats whom -> mint_get_competition_overview"
             "\n\n"
@@ -2412,8 +2247,7 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
             "'Which market performs best?', 'Average score per market this quarter'."
             "\n\n"
             "DON'T USE FOR (pick the right tool instead):\n"
-            "  - Day-by-day history of ONE topic        -> mint_get_topic_scores\n"
-            "  - A line chart over time                 -> mint_get_visibility_trend\n"
+            "  - Day-by-day history / trend curve of ONE topic -> mint_get_topic_scores\n"
             "  - Cited sources/URLs                      -> mint_get_topic_sources or mint_get_response_sources"
             "\n\n"
             "TIP: brand_filter ('IBIS') and market_filter ('FR') narrow the scope and reduce API "
@@ -2430,42 +2264,6 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
                 "startDate":     {"type": "string", "description": "Start date YYYY-MM-DD. Optional (default: 90 days ago)."},
                 "endDate":       {"type": "string", "description": "End date YYYY-MM-DD. Optional (default: today)."},
                 "models":        {"type": "string", "description": "Comma-separated model filter. Omit for cross-model average."},
-            },
-            "required": [],
-        },
-        {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
-    ),
-    (
-        "mint_get_visibility_trend",
-        (
-            "TIME-SERIES FOR CHARTING — visibility scores binned by day/week/month, shaped for "
-            "line charts: {series: [{name, points: [{date, score, n}]}]}. Use this specifically "
-            "when the user wants to SEE a trend/curve over time. After receiving the data, render "
-            "a line chart in a Claude artifact (e.g. Recharts)."
-            "\n\n"
-            "USE FOR: 'Weekly IBIS visibility curve since January', 'Monthly trend chart for Q1', "
-            "'Plot IBIS FR vs UK over 6 months' (use aggregation='per_topic')."
-            "\n\n"
-            "DON'T USE FOR (pick the right tool instead):\n"
-            "  - Just numbers, no chart, one topic   -> mint_get_topic_scores\n"
-            "  - A comparison table across topics     -> mint_get_scores_overview\n"
-            "  - Sources/URLs                          -> mint_get_topic_sources or mint_get_response_sources"
-            "\n\n"
-            "KEY PARAMS: granularity='week' (default; 'day'/'month' available); "
-            "aggregation='average' (single averaged series) or 'per_topic' (one series per topic "
-            "for visual comparison). Default period: Jan 1st of current year to today."
-        ),
-        {
-            "type": "object",
-            "properties": {
-                "brand_filter":  {"type": "string", "description": "Filter by brand name. Optional."},
-                "market_filter": {"type": "string", "description": "Filter by market keyword. Optional."},
-                "topic_ids":     {"type": "array", "items": {"type": "string"}, "description": "Explicit topicId list. Optional."},
-                "startDate":     {"type": "string", "description": "YYYY-MM-DD. Optional (default: Jan 1st current year)."},
-                "endDate":       {"type": "string", "description": "YYYY-MM-DD. Optional (default: today)."},
-                "models":        {"type": "string", "description": "Comma-separated model filter. Optional."},
-                "granularity":   {"type": "string", "enum": ["day", "week", "month"], "description": "Time bin size. Default: 'week'."},
-                "aggregation":   {"type": "string", "enum": ["average", "per_topic"], "description": "'average' = single series; 'per_topic' = one series per topic. Default: 'average'."},
             },
             "required": [],
         },
@@ -2524,9 +2322,8 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
             "  - 'Per-model snapshot of my score in one call' (model_breakdown)"
             "\n\n"
             "DON'T USE FOR (use the right detail tool instead):\n"
-            "  - Day-by-day score curve / per-model time series -> mint_get_topic_scores\n"
+            "  - Day-by-day score curve / time series / chart    -> mint_get_topic_scores\n"
             "  - Full top cited domains & URLs (and over time)   -> mint_get_topic_sources\n"
-            "  - A ready-to-plot chart                           -> mint_get_visibility_trend\n"
             "  - Owned/external + page brand analysis            -> mint_get_response_sources / mint_enrich_cited_sources\n"
             "  - Raw prompt-by-prompt export                     -> mint_get_raw_prompts\n"
             "  - Strengths / weaknesses, or who WINS vs rivals   -> mint_get_competition_overview\n"
@@ -2832,35 +2629,6 @@ TOOL_DEFINITIONS: list[tuple[str, str, dict, dict]] = [
         },
         {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
     ),
-    (
-        "mint_refine_query",
-        (
-            "GUIDED NARROWING for a BROAD question — when the user asks something open "
-            "('quelle source est la plus citée en France ?', 'mes forces et faiblesses ?') and "
-            "useful filters (brand, market, period, model) are missing, call this FIRST. It "
-            "offers the relevant refinements as a multi-select QCM, collects each chosen value "
-            "with a QCM, and finally returns status='ready' with concrete filters.\n\n"
-            "FLOW: call with just `question` -> it returns a `needs_clarification` QCM "
-            "(param='dimensions', multiSelect). Present it, then re-call with the chosen "
-            "`dimensions`; keep re-calling with the value asked in `clarification.param` "
-            "(brand, market, period, models) until status='ready', then run the analysis tool "
-            "with the returned `filters`. The user can pick 'Non — vue globale' to skip filters.\n\n"
-            "USE FOR: turning a vague analytics question into a precise scope without guessing."
-        ),
-        {
-            "type": "object",
-            "properties": {
-                "question":   {"type": "string", "description": "The user's original question (for context). Optional."},
-                "dimensions": {"type": "array", "items": {"type": "string"}, "description": "Chosen refinement dimensions: any of 'brand','market','period','model','none'. Omit on the first call."},
-                "brand":      {"type": "string", "description": "Chosen brand value (filled from a QCM answer)."},
-                "market":     {"type": "string", "description": "Chosen market value (filled from a QCM answer)."},
-                "period":     {"type": "string", "description": "Chosen period preset: '7d','30d','month','90d','180d'."},
-                "models":     {"type": "string", "description": "Chosen model name (filled from a QCM answer)."},
-            },
-            "required": [],
-        },
-        {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
-    ),
     # ── mint_get_raw_responses and mint_enrich_sources are intentionally NOT exposed. ──
     # mint_get_raw_responses (the old monolithic tool) is superseded by the pair
     # mint_get_response_sources (fast) + mint_enrich_cited_sources (deep), with
@@ -2877,7 +2645,6 @@ _TOOL_HANDLERS: dict[str, Any] = {
     "mint_get_models_by_topic":    _tool_get_models_by_topic,
     "mint_get_topic_scores":       _tool_get_topic_scores,
     "mint_get_scores_overview":    _tool_get_scores_overview,
-    "mint_get_visibility_trend":   _tool_get_visibility_trend,
     "mint_get_topic_sources":      _tool_get_topic_sources,
     "mint_get_topic_overview":     _tool_get_topic_overview,
     # v5 source tools (split from the old monolithic raw_responses)
@@ -2888,7 +2655,6 @@ _TOOL_HANDLERS: dict[str, Any] = {
     "mint_get_competition_overview":  _tool_get_competition_overview,
     "mint_get_competition_responses": _tool_get_competition_responses,
     "mint_resolve_scope":            _tool_resolve_scope,
-    "mint_refine_query":             _tool_refine_query,
     # superseded / unlisted but kept callable for backward compatibility
     "mint_get_raw_responses":      _tool_get_raw_responses,
     "mint_enrich_sources":         _tool_enrich_sources,
@@ -2897,7 +2663,6 @@ _TOOL_HANDLERS: dict[str, Any] = {
     "get_models_by_topic":    _tool_get_models_by_topic,
     "get_topic_scores":       _tool_get_topic_scores,
     "get_scores_overview":    _tool_get_scores_overview,
-    "get_visibility_trend":   _tool_get_visibility_trend,
     "get_topic_sources":      _tool_get_topic_sources,
     "get_topic_overview":     _tool_get_topic_overview,
     "get_raw_responses":      _tool_get_raw_responses,
@@ -2905,7 +2670,7 @@ _TOOL_HANDLERS: dict[str, Any] = {
 }
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    """Declare the 14 exposed tools with descriptions, schemas, and annotations."""
+    """Declare the 12 exposed tools with descriptions, schemas, and annotations."""
     return [
         Tool(
             name=name,
